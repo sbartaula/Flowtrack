@@ -191,14 +191,18 @@ def detect_fatigue_pattern(entries: list[dict]) -> dict[str, Any]:
     m_rate = rate(buckets["morning"])
     a_rate = rate(buckets["afternoon"])
     e_rate = rate(buckets["evening"])
-    delta  = round(((a_rate - m_rate) / max(m_rate, 1)) * 100, 1)
+    # percent change from morning to afternoon; handle zero-morning safely
+    if m_rate <= 0:
+        pm_vs_am_pct = 100.0 if a_rate > 0 else 0.0
+    else:
+        pm_vs_am_pct = round(((a_rate - m_rate) / m_rate) * 100, 1)
 
     return {
-        "morning_rate":    m_rate,
-        "afternoon_rate":  a_rate,
-        "evening_rate":    e_rate,
+        "morning_rate":     m_rate,
+        "afternoon_rate":   a_rate,
+        "evening_rate":     e_rate,
         "fatigue_detected": a_rate > m_rate * 1.5,
-        "pm_vs_am_pct":    delta,
+        "pm_vs_am_pct":     pm_vs_am_pct,
     }
 
 
@@ -359,9 +363,14 @@ def generate_text_report(
         "",
         "┌─ TOP APPLICATIONS BY TIME ─────────────────────────────────",
     ]
-    for app, mins in _top_apps(entries):
-        bar = "█" * int(mins / max(1, _top_apps(entries)[0][1]) * 30)
-        lines.append(f"│  {app:22s} {mins:7.1f} min  {bar}")
+    top_apps = _top_apps(entries)
+    if not top_apps:
+        lines.append("│  No application time data available.")
+    else:
+        max_mins = max(1.0, top_apps[0][1])
+        for app, mins in top_apps:
+            bar = "█" * int((mins / max_mins) * 30)
+            lines.append(f"│  {app:22s} {mins:7.1f} min  {bar}")
     lines.append("└────────────────────────────────────────────────────────────")
 
     lines += [
