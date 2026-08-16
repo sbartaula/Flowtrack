@@ -2,16 +2,29 @@ name: CI
 
 on:
   push:
-    branches: [master]
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  python-tests:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      FLOWTRACK_HOME: ${{ runner.temp }}/flowtrack-test-data
+      PYTHONDONTWRITEBYTECODE: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -20,19 +33,54 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
+          python -m pip check
 
-      - name: Syntax check (py_compile)
-        run: |
-          python -m py_compile dashboard.py
-          python -m py_compile tracker.py
-          python -m py_compile analyze.py
+      - name: Compile Python sources
+        run: python -m py_compile dashboard.py tracker.py analyze.py
 
-      - name: Import check
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  platform-files:
+    name: Installer, services, and static site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate installer
         run: |
-          python -c "import ast; ast.parse(open('dashboard.py').read()); print('dashboard.py: AST OK')"
-          python -c "import ast; ast.parse(open('tracker.py').read());   print('tracker.py:   AST OK')"
+          bash -n install.sh
+          shellcheck install.sh
+
+      - name: Validate systemd units
+        run: systemd-analyze verify focusaudit.service flowtrack-dashboard.service
+
+      - name: Validate deployment and static assets
+        run: |
+          python -m json.tool vercel.json >/dev/null
+          node --check script.js
+          test -f index.html
+          test -f demo.html
+          test -f styles.css
+          test -f script.js
+          test -f favicon.svg
+          test -f social-preview.svg
+          test -f social-preview.png

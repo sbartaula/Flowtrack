@@ -10,31 +10,55 @@ Manual:  python3 ~/.focusaudit/dashboard.py
 from __future__ import annotations
 
 import datetime
+import hashlib
+import hmac
 import json
 import os
 import platform
 import re
+import secrets
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-BASE_DIR        = Path.home() / ".focusaudit"
+BASE_DIR        = Path(os.environ.get("FLOWTRACK_HOME", Path.home() / ".focusaudit")).expanduser()
 SCREENSHOTS_DIR = BASE_DIR / "screenshots"
 LOG_DIR         = BASE_DIR / "logs"
 REPORTS_DIR     = BASE_DIR / "reports"
-VENV_PYTHON     = str(BASE_DIR / "venv" / "bin" / "python3")
-ANALYZE_SCRIPT  = str(BASE_DIR / "analyze.py")
 SERVICE_NAME    = "focusaudit"
 HOST            = "127.0.0.1"   # localhost only — never 0.0.0.0
 PORT            = 7070
 SCREENSHOT_CAP_GB = 3
+MAX_REQUEST_BYTES = 1024 * 1024
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+PROVIDER_DEFAULT_MODELS = {
+  "ollama": "llama3",
+  "openai": "gpt-4o-mini",
+  "anthropic": "claude-haiku-4-5-20251001",
+  "gemini": "gemini-3.6-flash",
+}
+CHAT_PROVIDER_DEFAULT_MODELS = {
+  **PROVIDER_DEFAULT_MODELS,
+  "xai": "grok-4.3",
+  "openrouter": "openai/gpt-4o-mini",
+  "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+  "groq": "openai/gpt-oss-20b",
+}
+API_KEY_ENV_VARS = {
+  "openai": "OPENAI_API_KEY",
+  "anthropic": "ANTHROPIC_API_KEY",
+  "gemini": "GEMINI_API_KEY",
+}
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
@@ -42,12 +66,167 @@ ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 XAI_URL = "https://api.x.ai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-LLAMAAPI_URL = "https://api.llama-api.com/chat/completions"
 TOGETHER_URL = "https://api.together.xyz/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-VISION_API_KEY = os.getenv("VISION_API_KEY", "")  # For Google Vision or Claude Vision
 
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _ensure_private_dir(path: Path) -> None:
+  path.mkdir(mode=0o700, parents=True, exist_ok=True)
+  if os.name == "posix":
+    try:
+      path.chmod(0o700)
+    except OSError:
+      pass
+
+
+for _data_dir in (BASE_DIR, SCREENSHOTS_DIR, LOG_DIR, REPORTS_DIR):
+  _ensure_private_dir(_data_dir)
+
+
+def _load_or_create_dashboard_token() -> str:
+  """Return a persistent same-user token stored below the private data dir."""
+  token_path = BASE_DIR / "dashboard-token"
+  for _ in range(20):
+    try:
+      existing = token_path.read_text(encoding="ascii").strip()
+      if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", existing):
+        if os.name == "posix":
+          token_path.chmod(0o600)
+        return existing
+    except (OSError, UnicodeError):
+      pass
+
+    token = secrets.token_urlsafe(32)
+    try:
+      fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+      # Another dashboard may be in the tiny window between creating and
+      # filling the file. Wait for its complete token instead of replacing it.
+      time.sleep(0.01)
+      continue
+    with os.fdopen(fd, "w", encoding="ascii") as fh:
+      fh.write(token + "\n")
+    if os.name == "posix":
+      token_path.chmod(0o600)
+    return token
+
+  raise RuntimeError(f"Dashboard token file is invalid or unreadable: {token_path}")
+
+
+DASHBOARD_TOKEN = _load_or_create_dashboard_token()
+DASHBOARD_TOKEN_HEADER = "X-Flowtrack-Token"
+DASHBOARD_LAUNCHER = Path(
+  os.environ.get("FLOWTRACK_LAUNCHER", Path.home() / "flowtrack-dashboard-launch.html")
+).expanduser()
+
+
+def _write_dashboard_launcher() -> None:
+  authenticated_url = f"http://{HOST}:{PORT}/?token={DASHBOARD_TOKEN}"
+  nonce = secrets.token_urlsafe(24)
+  expected_proof = hmac.new(
+    DASHBOARD_TOKEN.encode("ascii"), nonce.encode("ascii"), hashlib.sha256
+  ).hexdigest()
+  proof_url = f"http://{HOST}:{PORT}/api/launcher-proof?nonce={nonce}"
+  launcher_html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; connect-src http://{HOST}:{PORT}; style-src 'unsafe-inline'">
+<title>Opening Flowtrack…</title></head>
+<body><p id="status">Verifying and opening the authenticated Flowtrack dashboard…</p>
+<script>
+const target = {json.dumps(authenticated_url)};
+const expectedProof = {json.dumps(expected_proof)};
+fetch({json.dumps(proof_url)}, {{cache: 'no-store', referrerPolicy: 'no-referrer'}})
+  .then(response => {{ if (!response.ok) throw new Error('not ready'); return response.json(); }})
+  .then(data => {{
+    if (!data || data.proof !== expectedProof) throw new Error('server identity mismatch');
+    window.location.replace(target);
+  }})
+  .catch(() => {{
+    document.getElementById('status').textContent =
+      'Flowtrack is not ready or server verification failed. Run the flowtrack command again.';
+  }});
+</script></body></html>
+"""
+  fd = os.open(DASHBOARD_LAUNCHER, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+  with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(launcher_html)
+  if os.name == "posix":
+    DASHBOARD_LAUNCHER.chmod(0o600)
+
+
+_write_dashboard_launcher()
+
+
+def _resolve_analyze_script() -> str:
+  candidates = [
+    Path(__file__).with_name("analyze.py"),
+    BASE_DIR / "analyze.py",
+  ]
+  for candidate in candidates:
+    if candidate.exists():
+      return str(candidate)
+  return str(candidates[0])
+
+
+def _resolve_python_executable() -> str:
+  candidates = [
+    Path(sys.executable),
+    BASE_DIR / "venv" / "Scripts" / "python.exe",
+    BASE_DIR / "venv" / "bin" / "python3",
+  ]
+  for candidate in candidates:
+    if candidate and Path(candidate).exists():
+      return str(candidate)
+  return sys.executable or "python3"
+
+
+def _local_host_and_port(value: str, expected_port: int) -> bool:
+  """Return True only for an explicit loopback Host header on this server port."""
+  value = value.strip().lower()
+  if value.startswith("["):
+    match = re.fullmatch(r"\[([^]]+)]:(\d+)", value)
+    return bool(match and match.group(1) == "::1" and int(match.group(2)) == expected_port)
+  match = re.fullmatch(r"([^:]+):(\d+)", value)
+  return bool(match and match.group(1) in LOCAL_HOSTS and int(match.group(2)) == expected_port)
+
+
+def _local_origin(value: str, expected_port: int) -> bool:
+  try:
+    parsed = urlparse(value)
+    return (
+      parsed.scheme in {"http", "https"}
+      and (parsed.hostname or "").lower() in LOCAL_HOSTS
+      and parsed.port == expected_port
+      and not parsed.username
+      and not parsed.password
+    )
+  except ValueError:
+    return False
+
+
+def _open_folder(path: Path) -> tuple[bool, str]:
+  system_name = platform.system()
+  opener = "explorer.exe" if system_name == "Windows" else "open" if system_name == "Darwin" else "xdg-open"
+  if shutil.which(opener) is None:
+    return False, f"'{opener}' is not available on this system."
+  try:
+    subprocess.Popen(
+      [opener, str(path)],
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+    )
+    return True, ""
+  except OSError as exc:
+    return False, f"Open folder failed: {exc}"
+
+
+def _open_browser(url: str) -> None:
+  """Open a URL without allowing desktop integration failures to stop the server."""
+  try:
+    webbrowser.open(url, new=2)
+  except Exception:
+    pass
 
 # ── System helpers ─────────────────────────────────────────────────────────────
 
@@ -63,7 +242,13 @@ def _sh(cmd: list[str], timeout: int = 5) -> str:
 def service_status() -> dict:
   if platform.system() != "Linux":
     # On macOS/Windows, systemd is unavailable. Keep dashboard usable.
-    return {"active": False, "status": "unsupported", "pid": 0, "ram_mb": 0.0}
+    return {
+      "active": False,
+      "status": "manual",
+      "pid": 0,
+      "ram_mb": 0.0,
+      "service_controls_supported": False,
+    }
 
   active = _sh(["systemctl", "--user", "is-active", SERVICE_NAME])
   prop   = _sh(["systemctl", "--user", "show", SERVICE_NAME,
@@ -84,43 +269,79 @@ def service_status() -> dict:
           break
     except OSError:
       pass
-  return {"active": active == "active", "status": active,
-      "pid": pid, "ram_mb": ram_mb}
+  return {
+    "active": active == "active",
+    "status": active,
+    "pid": pid,
+    "ram_mb": ram_mb,
+    "service_controls_supported": True,
+  }
 
 
 def storage_stats() -> dict:
-    def _mb(p: Path, pat: str) -> float:
-        if not p.exists():
-            return 0.0
-        return round(
-            sum(f.stat().st_size for f in p.glob(pat) if f.is_file()) / (1024 * 1024), 2
-        )
-    total    = sum(f.stat().st_size for f in BASE_DIR.rglob("*") if f.is_file())
-    sc_count = len(list(SCREENSHOTS_DIR.glob("*.jpg"))) if SCREENSHOTS_DIR.exists() else 0
+    def _size(files) -> int:
+        total = 0
+        for file_path in files:
+            try:
+                if file_path.is_file():
+                    total += file_path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    screenshot_files = [
+        file_path
+        for pattern in ("*.jpg", "*.jpeg", "*.png")
+        for file_path in SCREENSHOTS_DIR.glob(pattern)
+    ]
+    total = _size(BASE_DIR.rglob("*"))
+    screenshots_size = _size(screenshot_files)
+    logs_size = _size(LOG_DIR.glob("*.jsonl"))
     return {
         "total_mb":         round(total / (1024 * 1024), 2),
-        "screenshots_mb":   _mb(SCREENSHOTS_DIR, "*.jpg"),
-        "logs_kb":          round(_mb(LOG_DIR, "*.jsonl") * 1024, 1),
-        "screenshot_count": sc_count,
+        "screenshots_mb":   round(screenshots_size / (1024 * 1024), 2),
+        "logs_kb":          round(logs_size / 1024, 1),
+        "screenshot_count": len(screenshot_files),
         "cap_gb":           SCREENSHOT_CAP_GB,
     }
 
 
-def sync_json_to_cloud(provider: str, target: str, api_key: str) -> dict:
-    """Upload all JSONL logs to a user-selected cloud target."""
+def _all_logs() -> dict[str, str]:
+    logs: dict[str, str] = {}
+    for file_path in sorted(LOG_DIR.glob("*.jsonl")):
+        try:
+            logs[file_path.name] = file_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return logs
+
+
+def _valid_webhook_url(target: str) -> bool:
+    try:
+        parsed = urlparse(target)
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    except ValueError:
+        return False
+
+
+def sync_json_to_cloud(
+    provider: str,
+    target: str,
+    api_key: str,
+    logs: dict[str, str] | None = None,
+) -> dict:
+    """Upload selected JSONL logs to a user-selected cloud target."""
     provider = provider.lower().strip()
     payload = {
         "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "logs": {},
+        "logs": logs if logs is not None else _all_logs(),
     }
-    for f in sorted(LOG_DIR.glob("*.jsonl")):
-        payload["logs"][f.name] = f.read_text(encoding="utf-8")
 
     data_text = json.dumps(payload, ensure_ascii=False, indent=2)
 
     if provider == "webhook":
-        if not target:
-            return {"ok": False, "error": "Webhook URL is required."}
+        if not _valid_webhook_url(target):
+            return {"ok": False, "error": "A valid HTTP(S) webhook URL is required."}
         req = urllib.request.Request(
             target,
             data=data_text.encode("utf-8"),
@@ -130,7 +351,7 @@ def sync_json_to_cloud(provider: str, target: str, api_key: str) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=30):
                 return {"ok": True, "message": "JSON backup sent to webhook."}
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, OSError) as exc:
             return {"ok": False, "error": f"Webhook upload failed: {exc}"}
 
     if provider == "gist":
@@ -159,8 +380,12 @@ def sync_json_to_cloud(provider: str, target: str, api_key: str) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 gist = json.loads(resp.read())
-                return {"ok": True, "message": "JSON backup uploaded to private gist.", "url": gist.get("html_url", "")}
-        except urllib.error.URLError as exc:
+                return {
+                    "ok": True,
+                    "message": "Uploaded to a secret (unlisted, not private) Gist. Anyone with its URL can read the logs.",
+                    "url": gist.get("html_url", ""),
+                }
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
             return {"ok": False, "error": f"Gist upload failed: {exc}"}
 
     return {"ok": False, "error": "Unsupported provider. Use gist or webhook."}
@@ -201,11 +426,8 @@ def _compat_endpoint(provider: str, base_url: str = "") -> tuple[str, str]:
     defaults = {
       "openai": OPENAI_URL,
       "xai": XAI_URL,
-      "grok": XAI_URL,
       "openrouter": OPENROUTER_URL,
-      "llamaapi": LLAMAAPI_URL,
       "together": TOGETHER_URL,
-      "opensource": TOGETHER_URL,
       "groq": GROQ_URL,
     }
     base = (base_url or defaults.get(provider, OPENAI_URL)).strip().rstrip("/")
@@ -247,7 +469,7 @@ def fetch_provider_models(provider: str, api_key: str, base_url: str = "") -> tu
         models = [m.get("name", "") for m in tags.get("models", []) if m.get("name")]
         return sorted(set(models)), None
 
-      compat = {"openai", "xai", "grok", "openrouter", "llamaapi", "together", "opensource", "groq"}
+      compat = {"openai", "xai", "openrouter", "together", "groq"}
       if provider in compat:
         if not api_key:
           return [], f"API key is required for {provider}."
@@ -292,6 +514,9 @@ def fetch_provider_models(provider: str, api_key: str, base_url: str = "") -> tu
           data = json.loads(resp.read())
         models: list[str] = []
         for item in data.get("models", []):
+          methods = item.get("supportedGenerationMethods", [])
+          if methods and "generateContent" not in methods:
+            continue
           name = item.get("name", "")
           if name.startswith("models/"):
             name = name.split("/", 1)[1]
@@ -367,7 +592,7 @@ def query_llm(
         text = data.get("response", "").strip()
         return (text if text else None, None if text else "Ollama returned an empty response.")
 
-    if provider in {"openai", "xai", "grok", "openrouter", "llamaapi", "together", "opensource", "groq"}:
+    if provider in {"openai", "xai", "openrouter", "together", "groq"}:
       if not api_key:
         return None, f"{provider} API key is required."
       chat_url, _ = _compat_endpoint(provider, base_url)
@@ -448,65 +673,38 @@ def today_events() -> list[dict]:
     if not f.exists():
         return []
     out = []
-    with open(f, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+    try:
+        with open(f, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        entry = json.loads(line)
+                        if isinstance(entry, dict):
+                            out.append(entry)
+                    except json.JSONDecodeError:
+                        pass
+    except OSError:
+        return []
     return out
 
 
 def recent_screenshots(limit: int = 12) -> list[str]:
     if not SCREENSHOTS_DIR.exists():
         return []
-    files = sorted(
-        SCREENSHOTS_DIR.glob("*.jpg"),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )
-    return [f.name for f in files[:limit]]
-
-
-def analyze_screenshot_image(image_path: str, api_key: str = "", provider: str = "gemini") -> str | None:
-    """Analyze a screenshot image with vision API to detect distractions, social media, etc."""
-    try:
-        # Read image file and encode as base64
-        img_file = SCREENSHOTS_DIR / image_path
-        if not img_file.exists() or not img_file.is_file():
-            return None
-        
-        with open(img_file, "rb") as f:
-            import base64
-            img_data = base64.b64encode(f.read()).decode('utf-8')
-        
-        if provider == "gemini" and api_key:
-            # Use Google Gemini Vision API
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-            payload = json.dumps({
-                "contents": [{
-                    "parts": [{
-                        "text": "Analyze this screenshot: What application is open? Is the user watching video (YouTube, Netflix, TikTok, etc)? Are they on social media (Instagram, Twitter, Facebook, etc)? List any distracting elements. What is their focus level? Be concise in 2-3 sentences."
-                    }, {
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": img_data
-                        }
-                    }]
-                }]
-            }).encode("utf-8")
-            
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-                text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-                return text if text else None
-        
-        return None
-    except Exception as exc:
-        return None
+    files = []
+    for pattern in ("*.jpg", "*.jpeg", "*.png"):
+        files.extend(SCREENSHOTS_DIR.glob(pattern))
+    dated_files = []
+    for file_path in files:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.(?:jpe?g|png)", file_path.name, re.IGNORECASE):
+            continue
+        try:
+            dated_files.append((file_path.stat().st_mtime, file_path.name))
+        except OSError:
+            continue
+    dated_files.sort(reverse=True)
+    return [name for _, name in dated_files[:max(0, limit)]]
 
 
 def export_logs_by_date(start_date: str = "", end_date: str = "") -> dict:
@@ -519,6 +717,10 @@ def export_logs_by_date(start_date: str = "", end_date: str = "") -> dict:
         
         start = datetime.date.fromisoformat(start_date)
         end = datetime.date.fromisoformat(end_date)
+        if start > end:
+            return {"error": "Start date must be on or before end date."}
+        if (end - start).days > 3660:
+            return {"error": "Date range is too large (maximum 10 years)."}
         
         payload = {"exported_at": datetime.datetime.now().isoformat(timespec="seconds"), "logs": {}}
         
@@ -530,8 +732,33 @@ def export_logs_by_date(start_date: str = "", end_date: str = "") -> dict:
             current += datetime.timedelta(days=1)
         
         return payload
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         return {"error": str(exc)}
+
+
+def logs_for_scope(backup_type: str, start_date: str = "", end_date: str = "") -> dict:
+    if backup_type == "today":
+        return export_logs_by_date()
+    if backup_type == "all":
+        return {
+            "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "logs": _all_logs(),
+        }
+    if backup_type == "custom":
+        if not start_date or not end_date:
+            return {"error": "Both start and end dates are required."}
+        return export_logs_by_date(start_date, end_date)
+    return {"error": "Unknown backup type. Use today, all, or custom."}
+
+
+def logs_as_jsonl(logs: dict[str, str]) -> bytes:
+    lines = []
+    for filename in sorted(logs):
+        lines.extend(line for line in logs[filename].splitlines() if line.strip())
+    content = "\n".join(lines)
+    if content:
+        content += "\n"
+    return content.encode("utf-8")
 
 
 def latest_report() -> str:
@@ -542,14 +769,17 @@ def latest_report() -> str:
 
 
 def _quick_focus(entries: list[dict]) -> str:
-    if len(entries) < 2:
+    if not entries:
         return "N/A"
     try:
-        durations  = [float(e.get("duration", 30)) for e in entries]
-        avg_dur    = sum(durations) / len(durations)
-        time_score = min(100.0, (avg_dur / 300) * 100)
-        rate_score = max(0.0, 100.0 - len(entries) * 0.8)
-        return str(round(0.5 * time_score + 0.5 * rate_score, 1))
+        # Keep the live card consistent with the full analyzer: repair legacy
+        # cumulative rows and merge adjacent v2 interval segments first.
+        from analyze import calculate_focus_score, normalize_entries
+
+        normalized = normalize_entries(entries)
+        if not any(float(entry.get("duration", 0)) > 0 for entry in normalized):
+            return "N/A"
+        return str(calculate_focus_score(normalized)["daily"])
     except Exception:
         return "N/A"
 
@@ -561,35 +791,45 @@ _running = False
 _result: dict = {"status": "idle", "output": "No analysis run yet. Click Run Analysis."}
 
 
-def _start_analysis(use_ai: bool, provider: str = "", model: str = "", api_key: str = "") -> None:
+def _start_analysis(use_ai: bool, provider: str = "", model: str = "", api_key: str = "") -> bool:
+  global _running, _result
+
+  provider = provider.lower().strip()
+  if provider == "none":
+    use_ai = False
+  if use_ai and provider not in PROVIDER_DEFAULT_MODELS:
+    _result = {"status": "error", "output": f"Unsupported analysis provider: {provider or '(empty)'}"}
+    return False
+
+  def _work() -> None:
     global _running, _result
+    try:
+      cmd = [_resolve_python_executable(), _resolve_analyze_script()]
+      child_env = os.environ.copy()
+      if not use_ai:
+        cmd.append("--no-ai")
+      elif provider:
+        cmd.extend(["--provider", provider, "--model", model or PROVIDER_DEFAULT_MODELS[provider]])
+        key_env = API_KEY_ENV_VARS.get(provider)
+        if api_key and key_env:
+          child_env[key_env] = api_key
+      r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=child_env)
+      out = r.stdout + (("\n\nSTDERR:\n" + r.stderr) if r.stderr else "")
+      _result = {"status": "done" if r.returncode == 0 else "error", "output": out}
+    except subprocess.TimeoutExpired:
+      _result = {"status": "error", "output": "Analysis timed out after 180 s."}
+    except Exception as exc:
+      _result = {"status": "error", "output": str(exc)}
+    finally:
+      _running = False
 
-    def _work() -> None:
-        global _running, _result
-        try:
-            cmd = [VENV_PYTHON, ANALYZE_SCRIPT]
-            if not use_ai:
-                cmd.append("--no-ai")
-            elif provider:
-                cmd.extend(["--provider", provider, "--model", model or "gpt-4o-mini"])
-                if api_key:
-                    cmd.extend(["--api-key", api_key])
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            out = r.stdout + (("\n\nSTDERR:\n" + r.stderr) if r.stderr else "")
-            _result = {"status": "done" if r.returncode == 0 else "error", "output": out}
-        except subprocess.TimeoutExpired:
-            _result = {"status": "error", "output": "Analysis timed out after 120 s."}
-        except Exception as exc:
-            _result = {"status": "error", "output": str(exc)}
-        finally:
-            _running = False
-
-    with _lock:
-        if _running:
-            return
-        _running = True
-        _result  = {"status": "running", "output": "Analysis in progress…"}
-    threading.Thread(target=_work, daemon=True).start()
+  with _lock:
+    if _running:
+      return False
+    _running = True
+    _result = {"status": "running", "output": "Analysis in progress…"}
+  threading.Thread(target=_work, daemon=True).start()
+  return True
 
 
 # ── Embedded HTML / CSS / JS ───────────────────────────────────────────────────
@@ -600,9 +840,6 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Flowtrack Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 :root{
   --bg:#111111;
@@ -621,7 +858,7 @@ HTML = r"""<!DOCTYPE html>
   --warn:#fbbf24;
   --warn-dim:rgba(251,191,36,.12);
   --text:#f5f5f4;
-  --muted:#737373;
+  --muted:#a3a3a3;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{
@@ -669,6 +906,7 @@ main{max-width:1440px;margin:0 auto;padding:28px 24px;display:flex;flex-directio
 .card-value{font-size:32px;font-weight:800;letter-spacing:-1px;line-height:1;color:var(--text);margin:8px 0}
 .card-sub{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.5}
 .c-accent-1{color:var(--accent)}.c-accent-2{color:var(--blue)}.c-accent-3{color:var(--warn)}.c-success{color:var(--success)}.c-warn{color:var(--warn)}.c-danger{color:var(--danger)}
+.two-col{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px}
 /* Controls */
 .controls{
   background:var(--surface);
@@ -756,6 +994,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
   transition:border-color .2s,transform .2s;
   aspect-ratio:16/10;
   background:var(--surface-2);
+  padding:0;width:100%;color:inherit;
 }
 .shot:hover{border-color:#555;transform:scale(1.03)}
 .shot img{width:100%;height:100%;object-fit:cover;display:block}
@@ -818,7 +1057,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
 .empty{text-align:center;color:var(--muted);padding:32px 16px;font-size:12px}
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#333;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#444}
 @media(max-width:1100px){.cards{grid-template-columns:repeat(2,1fr)}.two-col{grid-template-columns:1fr}}
-@media(max-width:640px){.cards{grid-template-columns:1fr}header{padding:12px 16px}main{padding:16px 12px}}
+@media(max-width:640px){.cards{grid-template-columns:1fr}header{padding:12px 16px;gap:8px}.hdr-right{gap:8px}.rtag{display:none}main{padding:16px 12px}}
 </style>
 </head>
 <body>
@@ -830,7 +1069,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
   </div>
   <div class="hdr-right">
     <div class="rtag"><span class="rdot" id="rdot"></span> auto-refresh 3 s</div>
-    <div class="badge inactive" id="svcBadge">
+    <div class="badge inactive" id="svcBadge" role="status" aria-live="polite">
       <span class="dot"></span><span id="svcTxt">checking…</span>
     </div>
   </div>
@@ -842,23 +1081,23 @@ tr:hover td{background:rgba(255,255,255,.03)}
   <div class="cards">
     <div class="card">
       <div class="card-label">Focus Score</div>
-      <div class="card-value c-accent" id="cScore">—</div>
+      <div class="card-value c-accent-1" id="cScore">—</div>
       <div class="card-sub">out of 100 · based on today</div>
     </div>
     <div class="card">
       <div class="card-label">Tracker RAM</div>
-      <div class="card-value c-green" id="cRam">—</div>
+      <div class="card-value c-success" id="cRam">—</div>
       <div class="card-sub" id="cRamSub">MB used by daemon</div>
     </div>
     <div class="card">
       <div class="card-label">Storage Used</div>
-      <div class="card-value c-yellow" id="cStorage">—</div>
+      <div class="card-value c-warn" id="cStorage">—</div>
       <div class="card-sub" id="cStorageSub">MB in ~/.focusaudit/</div>
     </div>
     <div class="card">
       <div class="card-label">Events Today</div>
-      <div class="card-value c-accent" id="cEvents">—</div>
-      <div class="card-sub">window changes logged</div>
+      <div class="card-value c-accent-1" id="cEvents">—</div>
+      <div class="card-sub">activity segments logged</div>
     </div>
   </div>
 
@@ -878,21 +1117,8 @@ tr:hover td{background:rgba(255,255,255,.03)}
       <button class="btn btn-muted"  onclick="runAnalysis(true)">🤖 Run with Selected AI</button>
       <div class="sep"></div>
       <button class="btn btn-muted"  onclick="openFolder()">🗂 Open Screenshots</button>
-      <button class="btn btn-muted"  onclick="syncJson()">☁ Backup JSON</button>
-      <button class="btn btn-muted"  onclick="window.open('/api/logs?limit=500','_blank')">📄 Raw Log JSON</button>
+      <button class="btn btn-muted"  onclick="window.open('/api/logs?limit=500&amp;token='+encodeURIComponent(FLOWTRACK_TOKEN),'_blank')">📄 Raw Log JSON</button>
     </div>
-    <div class="ctrl-row" style="margin-top:12px">
-      <label style="font-size:11px;color:var(--muted);font-weight:700">Cloud Backup (optional):</label>
-      <select id="syncProvider" class="btn btn-muted" style="padding:7px 10px" onchange="updateBackupUI()">
-        <option value="gist">GitHub Gist (private backup)</option>
-        <option value="webhook">Webhook URL (POST to your server)</option>
-      </select>
-      <input id="syncTarget" placeholder="Webhook URL (required for webhook provider)" style="flex:1;min-width:260px;background:#0f172a;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-size:12px" value="">
-      <input id="syncApiKey" type="password" placeholder="GitHub token (required for gist provider)" style="flex:1;min-width:260px;background:#0f172a;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-size:12px" value="">
-      <button class="btn btn-muted" onclick="syncJson()">☁ Upload Now</button>
-    </div>
-    <div id="syncMsg" style="margin-top:8px;font-size:11px;color:var(--muted)">Cloud backup is optional. Choose provider, add credentials, then click Upload.</div>
-
     <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
       <div class="ctrl-row" style="margin-top:0">
         <label style="font-size:11px;color:var(--muted);font-weight:700">📅 Download/Backup Logs:</label>
@@ -902,7 +1128,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
           <option value="custom">Custom date range</option>
         </select>
       </div>
-      <div id="dateRangeDiv" style="display:none;margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <div id="dateRangeDiv" style="display:none;margin-top:10px;gap:8px;flex-wrap:wrap;align-items:center">
         <label style="font-size:11px;color:var(--muted)">From:</label>
         <input id="backupStartDate" type="date" style="min-width:140px;background:#0f172a;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-size:11px">
         <label style="font-size:11px;color:var(--muted)">To:</label>
@@ -912,27 +1138,16 @@ tr:hover td{background:rgba(255,255,255,.03)}
         <button class="btn btn-accent" onclick="downloadBackup()">💾 Download to Laptop</button>
         <select id="uploadProvider" class="btn btn-muted" style="padding:7px 10px;min-width:140px" onchange="updateUploadUI()">
           <option value="none">No cloud upload</option>
-          <option value="gist">GitHub Gist</option>
-          <option value="gdrive">Google Drive</option>
+          <option value="gist">GitHub secret Gist (unlisted)</option>
           <option value="webhook">Webhook URL</option>
         </select>
-        <input id="uploadTarget" placeholder="GitHub token / Google token / Webhook URL" style="flex:1;min-width:200px;background:#0f172a;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-size:11px;display:none" value="">
+        <input id="uploadTarget" placeholder="GitHub token or webhook URL" aria-label="Cloud backup credential or URL" style="flex:1;min-width:200px;background:#0f172a;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-size:11px;display:none" value="">
         <button class="btn btn-accent2" onclick="uploadBackup()" style="display:none" id="uploadBtn">☁ Upload to Cloud</button>
       </div>
-      <div id="backupMsg" style="margin-top:8px;font-size:11px;color:var(--muted)"></div>
+      <div style="margin-top:8px;font-size:11px;color:var(--warn)">Cloud upload sends activity logs off this device. GitHub secret Gists are unlisted, not private; anyone with the URL can read them.</div>
+      <div id="backupMsg" role="status" aria-live="polite" style="margin-top:8px;font-size:11px;color:var(--muted)"></div>
     </div>
 
-    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
-      <div class="ctrl-row" style="margin-top:0">
-        <label style="font-size:11px;color:var(--muted);font-weight:700">📷 Idle Detection (Optional):</label>
-        <label style="display:inline-flex;align-items:center;cursor:pointer;gap:6px">
-          <input type="checkbox" id="cameraToggle" onchange="toggleCamera()" style="width:16px;height:16px;cursor:pointer">
-          <span style="font-size:11px;color:var(--text)">Enable Camera Monitoring</span>
-        </label>
-      </div>
-      <div id="cameraMsg" style="margin-top:8px;font-size:11px;display:none"></div>
-      <p style="margin-top:8px;font-size:10px;color:var(--muted)">When enabled, Flowtrack will silently capture your face (no flash) every 5 minutes on idle windows. Helps detect if you're actually working or distracted. Completely optional.</p>
-    </div>
   </div>
 
   <!-- ── Live Log + Screenshots ── -->
@@ -969,7 +1184,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
   <div class="analysis">
     <div class="analysis-toolbar">
       <strong style="font-size:13px">🤖 AI Analysis Report</strong>
-      <span style="font-size:11px;color:var(--muted)" id="analysisMeta">Idle</span>
+      <span style="font-size:11px;color:var(--muted)" id="analysisMeta" role="status" aria-live="polite">Idle</span>
       <button class="btn btn-muted" style="margin-left:auto" onclick="scrollToTop('analysisOut')">↑ Top</button>
     </div>
     <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -992,7 +1207,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
       <button class="btn btn-warn" style="font-size:11px;padding:4px 10px" onclick="ollamaFreeRAM('analysis')">⬡ Free RAM</button>
     </div>
     <div id="analysisKeyStatus" style="padding:0 20px 8px 20px;font-size:11px;color:var(--muted);display:none"></div>
-    <div class="analysis-output ao-done" id="analysisOut">No analysis run yet. Click "Run Analysis" above.</div>
+    <div class="analysis-output ao-done" id="analysisOut" aria-live="polite">No analysis run yet. Click "Run Analysis" above.</div>
   </div>
 
   <div class="analysis">
@@ -1005,9 +1220,8 @@ tr:hover td{background:rgba(255,255,255,.03)}
         <option value="ollama">Ollama (local, no key)</option>
         <option value="openai">OpenAI (requires API key)</option>
         <option value="xai">xAI Grok (requires API key)</option>
-        <option value="llamaapi">LlamaAPI (requires API key)</option>
         <option value="openrouter">OpenRouter (requires API key)</option>
-        <option value="together">Open Source API (Together)</option>
+        <option value="together">Together AI</option>
         <option value="groq">Groq (requires API key)</option>
         <option value="anthropic">Anthropic (requires API key)</option>
         <option value="gemini">Gemini (requires API key)</option>
@@ -1032,23 +1246,26 @@ tr:hover td{background:rgba(255,255,255,.03)}
       <button class="btn btn-warn" style="font-size:11px;padding:4px 10px" onclick="ollamaFreeRAM('chat')">⬡ Free RAM</button>
     </div>
     <div id="chatKeyStatus" style="padding:0 20px 8px 20px;font-size:11px;color:var(--muted);display:none"></div>
-    <div class="analysis-output chat-thread" id="chatOut"><div class="empty" style="padding:12px 4px">Ask your first question. Follow-ups are remembered in this session.</div></div>
+    <div class="analysis-output chat-thread" id="chatOut" aria-live="polite"><div class="empty" style="padding:12px 4px">Ask your first question. Follow-ups are remembered in this session.</div></div>
   </div>
 
 </main>
 
 <!-- Modal -->
-<div class="modal" id="modal" onclick="closeModal()">
-  <button class="modal-x" onclick="closeModal()">✕</button>
+<div class="modal" id="modal" role="dialog" aria-modal="true" aria-hidden="true" aria-label="Screenshot preview" onclick="if(event.target===this) closeModal()">
+  <button class="modal-x" id="modalClose" aria-label="Close screenshot preview" onclick="closeModal()">✕</button>
   <img id="modalImg" src="" alt="">
 </div>
 
 <script>
+const FLOWTRACK_TOKEN = __FLOWTRACK_TOKEN__;
 let pollTimer = null;
 
 // ── API ───────────────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
-  try { return await (await fetch(path, opts)).json(); }
+  const headers = new Headers(opts.headers || {});
+  headers.set('X-Flowtrack-Token', FLOWTRACK_TOKEN);
+  try { return await (await fetch(path, {...opts, headers})).json(); }
   catch { return null; }
 }
 
@@ -1064,13 +1281,16 @@ async function fetchStatus() {
   const d = await api('/api/status');
   if (!d) return;
 
+  const controlsSupported = d.service_controls_supported !== false;
   const badge = document.getElementById('svcBadge');
   badge.className = 'badge ' + (d.active ? 'active' : 'inactive');
-  document.getElementById('svcTxt').textContent = d.active ? 'Tracker Active' : 'Tracker Stopped';
+  document.getElementById('svcTxt').textContent = controlsSupported
+    ? (d.active ? 'Tracker Active' : 'Tracker Stopped')
+    : 'Manual tracker mode';
 
-  document.getElementById('btnStart').disabled   =  d.active;
-  document.getElementById('btnStop').disabled    = !d.active;
-  document.getElementById('btnRestart').disabled = !d.active;
+  document.getElementById('btnStart').disabled   = !controlsSupported || d.active;
+  document.getElementById('btnStop').disabled    = !controlsSupported || !d.active;
+  document.getElementById('btnRestart').disabled = !controlsSupported || !d.active;
 
   document.getElementById('cRam').textContent     = d.ram_mb + ' MB';
   document.getElementById('cStorage').textContent = d.total_mb + ' MB';
@@ -1126,11 +1346,14 @@ async function fetchShots() {
     return;
   }
   grid.innerHTML = d.map(name => {
-    const label = name.replace(/\.jpg$/, '').replace(/_/g, ' ');
+    const safeName = escHtml(name);
+    const encodedName = encodeURIComponent(name);
+    const label = escHtml(name.replace(/\.(?:jpe?g|png)$/i, '').replace(/_/g, ' '));
+    const screenshotUrl = `/screenshots/${encodedName}?token=${encodeURIComponent(FLOWTRACK_TOKEN)}`;
     return `<div class="shot-wrap">
-      <div class="shot" onclick="openModal('/screenshots/${name}')">
-        <img src="/screenshots/${name}" loading="lazy" alt="${name}">
-      </div>
+      <button type="button" class="shot" aria-label="Open screenshot ${label}" onclick="openModal('${screenshotUrl}', '${safeName}')">
+        <img src="${screenshotUrl}" loading="lazy" alt="Screenshot ${safeName}">
+      </button>
       <div class="shot-ts">${label}</div>
     </div>`;
   }).join('');
@@ -1140,11 +1363,15 @@ async function fetchShots() {
 async function svc(action) {
   const labels = {start:'Starting…', stop:'Stopping…', restart:'Restarting…'};
   document.getElementById('svcTxt').textContent = labels[action] || action;
-  await api('/api/service', {
+  const d = await api('/api/service', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({action}),
   });
+  if (!d || !d.ok) {
+    document.getElementById('svcTxt').textContent = (d && d.error) || 'Service action failed';
+    return;
+  }
   setTimeout(fetchStatus, 1800);
 }
 
@@ -1172,7 +1399,10 @@ async function checkAutoStart() {
     const d = await api('/api/autostart');
     if (!d) return;
     const cb = document.getElementById('autoStartToggle');
-    if (cb) cb.checked = d.enabled;
+    if (cb) {
+      cb.checked = d.enabled;
+      cb.disabled = d.supported === false;
+    }
   } catch(e) {}
 }
 
@@ -1191,7 +1421,7 @@ async function runAnalysis(useAI) {
     apiKey = document.getElementById('analysisApiKey').value.trim();
   }
   
-  await api('/api/analyze', {
+  const started = await api('/api/analyze', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
@@ -1201,6 +1431,11 @@ async function runAnalysis(useAI) {
       api_key: apiKey,
     }),
   });
+  if (!started || !started.ok) {
+    setAnalysisUI('error', (started && started.error) || 'Analysis could not be started.');
+    document.getElementById('analysisMeta').textContent = 'Error ✗';
+    return;
+  }
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(pollAnalysis, 1500);
 }
@@ -1229,7 +1464,8 @@ function setAnalysisUI(status, text) {
 }
 
 function _escapeHtml(s) {
-  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function renderAnalysisReport(text) {
@@ -1273,68 +1509,11 @@ function scrollToTop(id) {
 
 // ── Open folder ───────────────────────────────────────────────────────────────
 function openFolder() {
-  api('/api/open-screenshots', {method: 'POST'});
-}
-
-function updateBackupUI() {
-  const provider = document.getElementById('syncProvider').value;
-  const target = document.getElementById('syncTarget');
-  const apiKey = document.getElementById('syncApiKey');
-  
-  if (provider === 'webhook') {
-    target.placeholder = 'Your webhook URL (e.g., https://example.com/webhook)';
-    target.style.display = 'block';
-    apiKey.placeholder = 'Leave empty for webhook';
-    apiKey.style.display = 'block';
-  } else {
-    target.placeholder = 'Leave empty for gist';
-    target.style.display = 'block';
-    apiKey.placeholder = 'Your GitHub token (required for gist)';
-    apiKey.style.display = 'block';
-  }
-}
-
-async function syncJson() {
-  const provider = document.getElementById('syncProvider').value;
-  const target   = document.getElementById('syncTarget').value.trim();
-  const apiKey   = document.getElementById('syncApiKey').value.trim();
-  const msg = document.getElementById('syncMsg');
-  
-  if (provider === 'gist' && !apiKey) {
-    msg.style.color = 'var(--red)';
-    msg.textContent = 'Error: GitHub token is required for Gist backup.';
-    return;
-  }
-  
-  if (provider === 'webhook' && !target) {
-    msg.style.color = 'var(--red)';
-    msg.textContent = 'Error: Webhook URL is required for webhook backup.';
-    return;
-  }
-  
-  msg.style.color = 'var(--yellow)';
-  msg.textContent = 'Uploading backup to ' + provider + '...';
-  
-  const d = await api('/api/sync-json', {
+  api('/api/open-screenshots', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({provider, target, api_key: apiKey}),
+    body: '{}',
   });
-  
-  if (!d) {
-    msg.style.color = 'var(--red)';
-    msg.textContent = 'Backup failed: no response from server.';
-    return;
-  }
-  
-  if (d.ok) {
-    msg.style.color = 'var(--green)';
-    const url = d.url ? ' - View: ' + d.url : '';
-    msg.textContent = '✓ ' + d.message + url;
-  } else {
-    msg.style.color = 'var(--red)';
-    msg.textContent = 'Backup failed: ' + (d.error || 'Unknown error');
-  }
 }
 
 function fillChatTemplate() {
@@ -1346,7 +1525,8 @@ let chatHistory = [];
 const CHAT_MAX_TURNS = 12;
 
 function escHtml(s) {
-  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function copyCmd(btn) {
@@ -1384,20 +1564,14 @@ function clearChat() {
 
 // ── Model presets per provider ───────────────────────────────────────────────
 const MODEL_PRESETS = {
-  ollama:    ['llama3', 'llama3.2', 'llama3.1', 'llama3.2:1b', 'gemma3', 'gemma2', 'mistral', 'phi4', 'phi3', 'deepseek-r1', 'qwen2.5', 'codellama', 'nomic-embed-text'],
-  openai:    ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o1-mini', 'o3-mini'],
-  xai:       ['grok-beta', 'grok-2-latest', 'grok-2-vision-latest'],
-  groq:      ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'],
-  llamaapi:  ['llama3.1-70b', 'llama3.1-8b', 'mixtral-8x7b'],
-  openrouter:['openai/gpt-4o-mini', 'meta-llama/llama-3.1-70b-instruct', 'google/gemini-2.0-flash-001'],
-  together:  ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'deepseek-ai/DeepSeek-R1-Distill-Llama-70B', 'Qwen/Qwen2.5-72B-Instruct-Turbo'],
-  anthropic: ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
-  gemini:    ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-pro', 'gemini-1.5-flash'],
-};
-const MODEL_DEFAULTS = {
-  ollama: 'llama3', openai: 'gpt-4o-mini',
-  xai: 'grok-2-latest', groq: 'llama-3.1-8b-instant', llamaapi: 'llama3.1-70b', openrouter: 'openai/gpt-4o-mini', together: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
-  anthropic: 'claude-3-5-sonnet-20241022', gemini: 'gemini-2.0-flash', none: '',
+  ollama:    ['llama3', 'llama3.2', 'llama3.1', 'llama3.2:1b', 'gemma3', 'gemma2', 'mistral', 'phi4', 'phi3', 'deepseek-r1', 'qwen2.5', 'codellama'],
+  openai:    ['gpt-4o-mini'],
+  xai:       ['grok-4.5', 'grok-4.3', 'grok-latest'],
+  groq:      ['openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'qwen/qwen3.6-27b'],
+  openrouter:['openai/gpt-4o-mini'],
+  together:  ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'openai/gpt-oss-20b', 'openai/gpt-oss-120b'],
+  anthropic: ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-7'],
+  gemini:    ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'],
 };
 
 function normalizeModelValue(value) {
@@ -1455,7 +1629,6 @@ function updateChatPlaceholders() {
     openai: 'sk-... (OpenAI API key)',
     xai: 'xai-... (xAI API key)',
     groq: 'gsk_... (Groq API key)',
-    llamaapi: 'LlamaAPI key',
     openrouter: 'sk-or-... (OpenRouter API key)',
     together: 'Together API key',
     anthropic: 'sk-ant-... (Anthropic API key)',
@@ -1473,7 +1646,6 @@ function updateAnalysisPlaceholders() {
     openai: 'sk-... (OpenAI API key)',
     xai: 'xai-... (xAI API key)',
     groq: 'gsk_... (Groq API key)',
-    llamaapi: 'LlamaAPI key',
     openrouter: 'sk-or-... (OpenRouter API key)',
     together: 'Together API key',
     anthropic: 'sk-ant-... (Anthropic API key)',
@@ -1526,9 +1698,9 @@ async function ollamaStart(section) {
 
 async function ollamaFreeRAM(section) {
   const {status, model} = _ollamaIds(section);
-  const modelName = (model && model.value.trim()) || 'llama3';
+  const modelName = normalizeModelValue(model && model.value.trim());
   status.style.color = 'var(--warn)';
-  status.textContent = `Unloading ${modelName} from RAM…`;
+  status.textContent = `Unloading ${modelName || 'loaded model'} from RAM…`;
   const d = await api('/api/ollama', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({action: 'unload', model: modelName}),
@@ -1559,19 +1731,19 @@ function ollamaErrHtml(errMsg) {
 
 async function verifyChatKey() {
   const provider = document.getElementById('chatProvider').value;
-  const model = normalizeModelValue(document.getElementById('chatModel').value.trim()) || 'llama3';
+  const model = normalizeModelValue(document.getElementById('chatModel').value.trim());
   const apiKey = document.getElementById('chatApiKey').value.trim();
   const baseUrl = document.getElementById('chatBaseUrl').value.trim();
   const statusDiv = document.getElementById('chatKeyStatus');
   
   if (provider !== 'ollama' && !apiKey) {
-    statusDiv.style.color = 'var(--red)';
+    statusDiv.style.color = 'var(--danger)';
     statusDiv.textContent = 'API key is required for ' + provider + '.';
     statusDiv.style.display = 'block';
     return;
   }
   
-  statusDiv.style.color = 'var(--yellow)';
+  statusDiv.style.color = 'var(--warn)';
   statusDiv.textContent = provider === 'ollama'
     ? 'Testing Ollama connection...'
     : ('Testing ' + provider + ' API key...');
@@ -1591,19 +1763,19 @@ async function verifyChatKey() {
   });
   
   if (d && d.ok) {
-    statusDiv.style.color = 'var(--green)';
+    statusDiv.style.color = 'var(--success)';
     statusDiv.textContent = provider === 'ollama'
       ? 'Ollama connection verified! Response: ' + (d.reply ? d.reply.substring(0, 100) : 'OK')
       : ('API key verified! Response: ' + (d.reply ? d.reply.substring(0, 100) : 'OK'));
   } else {
-    statusDiv.style.color = 'var(--red)';
+    statusDiv.style.color = 'var(--danger)';
     statusDiv.textContent = 'Verification failed: ' + (d ? d.error : 'No response') + '. Check provider, model, and network.';
   }
 }
 
 async function verifyAnalysisKey() {
   const provider = document.getElementById('analysisProvider').value;
-  const model = normalizeModelValue(document.getElementById('analysisModel').value.trim()) || 'llama3';
+  const model = normalizeModelValue(document.getElementById('analysisModel').value.trim());
   const apiKey = document.getElementById('analysisApiKey').value.trim();
   const statusDiv = document.getElementById('analysisKeyStatus');
   
@@ -1614,13 +1786,13 @@ async function verifyAnalysisKey() {
   }
   
   if (provider !== 'ollama' && !apiKey) {
-    statusDiv.style.color = 'var(--red)';
+    statusDiv.style.color = 'var(--danger)';
     statusDiv.textContent = 'API key is required for ' + provider + '.';
     statusDiv.style.display = 'block';
     return;
   }
   
-  statusDiv.style.color = 'var(--yellow)';
+  statusDiv.style.color = 'var(--warn)';
   statusDiv.textContent = provider === 'ollama'
     ? 'Testing Ollama connection for analysis...'
     : ('Testing ' + provider + ' API key for analysis...');
@@ -1632,19 +1804,19 @@ async function verifyAnalysisKey() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       provider,
-      model: model || 'gpt-4o-mini',
+      model,
       api_key: apiKey,
       prompt: testPrompt,
     }),
   });
   
   if (d && d.ok) {
-    statusDiv.style.color = 'var(--green)';
+    statusDiv.style.color = 'var(--success)';
     statusDiv.textContent = provider === 'ollama'
       ? 'Ollama connection verified for analysis!'
       : 'API key verified for analysis!';
   } else {
-    statusDiv.style.color = 'var(--red)';
+    statusDiv.style.color = 'var(--danger)';
     statusDiv.textContent = 'Verification failed: ' + (d ? d.error : 'No response') + '. Check provider, model, and network.';
   }
 }
@@ -1673,10 +1845,10 @@ async function chatAsk() {
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', 'X-Flowtrack-Token': FLOWTRACK_TOKEN},
       body: JSON.stringify({
         provider: document.getElementById('chatProvider').value,
-        model: normalizeModelValue(document.getElementById('chatModel').value.trim()) || 'llama3',
+        model: normalizeModelValue(document.getElementById('chatModel').value.trim()),
         api_key: document.getElementById('chatApiKey').value.trim(),
         base_url: document.getElementById('chatBaseUrl').value.trim(),
         history: chatHistory.slice(0, -1),
@@ -1708,41 +1880,7 @@ async function chatAsk() {
   }
 }
 
-// ── Camera Capture (new feature) ───────────────────────────────────────────────
-async function toggleCamera() {
-  const checkbox = document.getElementById('cameraToggle');
-  const msg = document.getElementById('cameraMsg');
-  msg.style.display = 'block';
-  
-  if (checkbox.checked) {
-    // Request permission
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({video: {width: 1280, height: 720}, audio: false});
-      stream.getTracks().forEach(track => track.stop());
-      msg.textContent = '✓ Camera enabled! Idle detection active (silent, no flash).';
-      msg.style.color = 'var(--success)';
-      localStorage.setItem('flowtrack_camera_enabled', 'true');
-    } catch (err) {
-      checkbox.checked = false;
-      if (err.name === 'NotAllowedError') {
-        msg.textContent = '✗ Camera permission denied. Check browser privacy settings.';
-      } else {
-        msg.textContent = '✗ Camera not available: ' + err.message;
-      }
-      msg.style.color = 'var(--danger)';
-    }
-  } else {
-    // Disable
-    msg.textContent = '✓ Camera monitoring disabled.';
-    msg.style.color = 'var(--muted)';
-    localStorage.setItem('flowtrack_camera_enabled', 'false');
-  }
-}
-
-// Check if camera was previously enabled
 window.addEventListener('DOMContentLoaded', () => {
-  const wasEnabled = localStorage.getItem('flowtrack_camera_enabled') === 'true';
-  document.getElementById('cameraToggle').checked = wasEnabled;
   const prompt = document.getElementById('chatPrompt');
   const chatApiKey = document.getElementById('chatApiKey');
   const chatBaseUrl = document.getElementById('chatBaseUrl');
@@ -1790,9 +1928,6 @@ function updateUploadUI() {
     if (provider === 'gist') {
       targetInput.placeholder = 'GitHub personal access token (required)';
       targetInput.type = 'password';
-    } else if (provider === 'gdrive') {
-      targetInput.placeholder = 'Google Drive API token or folder ID (required)';
-      targetInput.type = 'text';
     } else if (provider === 'webhook') {
       targetInput.placeholder = 'Webhook URL (required)';
       targetInput.type = 'text';
@@ -1822,7 +1957,7 @@ async function downloadBackup() {
     
     const response = await fetch('/api/backup-download', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', 'X-Flowtrack-Token': FLOWTRACK_TOKEN},
       body: JSON.stringify({backup_type: backupType, start_date: startDate, end_date: endDate}),
     });
     
@@ -1860,7 +1995,7 @@ async function uploadBackup() {
   msg.textContent = '⏳ Uploading...';
   
   if (!credential) {
-    msg.textContent = '✗ Please enter ' + (provider === 'gist' ? 'GitHub token' : provider === 'gdrive' ? 'Google token' : 'webhook URL');
+    msg.textContent = '✗ Please enter ' + (provider === 'gist' ? 'GitHub token' : 'webhook URL');
     msg.style.color = 'var(--danger)';
     return;
   }
@@ -1889,7 +2024,7 @@ async function uploadBackup() {
     
     const response = await fetch('/api/backup-upload', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', 'X-Flowtrack-Token': FLOWTRACK_TOKEN},
       body: JSON.stringify(payload),
     });
     
@@ -1908,89 +2043,36 @@ async function uploadBackup() {
   }
 }
 
-async function backupWithDateRange() {
-  const backupType = document.getElementById('backupType').value;
-  const provider = document.getElementById('syncProvider').value;
-  const target = document.getElementById('syncTarget').value.trim();
-  const apiKey = document.getElementById('syncApiKey').value.trim();
-  const msg = document.getElementById('syncMsg');
-  
-  if (provider === 'gist' && !apiKey) {
-    msg.textContent = '✗ GitHub token required for Gist.';
-    msg.style.color = 'var(--danger)';
-    return;
-  }
-  if (provider === 'webhook' && !target) {
-    msg.textContent = '✗ Webhook URL required.';
-    msg.style.color = 'var(--danger)';
-    return;
-  }
-  
-  let startDate = '';
-  let endDate = '';
-  
-  if (backupType === 'custom') {
-    startDate = document.getElementById('backupStartDate').value;
-    endDate = document.getElementById('backupEndDate').value;
-    if (!startDate || !endDate) {
-      msg.textContent = '✗ Select start and end dates.';
-      msg.style.color = 'var(--danger)';
-      return;
-    }
-  }
-  
-  msg.style.color = 'var(--warn)';
-  msg.textContent = 'Exporting ' + backupType + ' logs...';
-  
-  const d = await api('/api/backup-date-range', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      backup_type: backupType,
-      start_date: startDate,
-      end_date: endDate,
-      provider,
-      target,
-      api_key: apiKey,
-    }),
-  });
-  
-  if (!d) {
-    msg.style.color = 'var(--danger)';
-    msg.textContent = '✗ No response from server.';
-    return;
-  }
-  
-  if (d.ok) {
-    msg.style.color = 'var(--success)';
-    if (d.download_url) {
-      msg.textContent = '✓ ' + (d.message || 'Backup ready.');
-      if (typeof d.download_url === 'string' && d.download_url.startsWith('/')) {
-        const a = document.createElement('a');
-        a.href = d.download_url;
-        a.style.color = 'var(--accent)';
-        a.style.textDecoration = 'underline';
-        a.textContent = ' Download here';
-        msg.appendChild(a);
-      }
-    } else {
-      msg.textContent = '✓ ' + d.message;
-    }
-  } else {
-    msg.style.color = 'var(--danger)';
-    msg.textContent = '✗ ' + (d.error || 'Backup failed.');
-  }
-}
-
 // ── Modal ─────────────────────────────────────────────────────────────────────
-function openModal(src) {
-  document.getElementById('modalImg').src = src;
-  document.getElementById('modal').classList.add('open');
+let modalReturnFocus = null;
+function openModal(src, label = 'Screenshot preview') {
+  modalReturnFocus = document.activeElement;
+  const image = document.getElementById('modalImg');
+  const modal = document.getElementById('modal');
+  image.src = src;
+  image.alt = label;
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  document.getElementById('modalClose').focus();
 }
 function closeModal() {
-  document.getElementById('modal').classList.remove('open');
+  const modal = document.getElementById('modal');
+  const image = document.getElementById('modalImg');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+  image.src = '';
+  image.alt = '';
+  if (modalReturnFocus && modalReturnFocus.focus) modalReturnFocus.focus();
 }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('keydown', e => {
+  const modal = document.getElementById('modal');
+  if (!modal.classList.contains('open')) return;
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    document.getElementById('modalClose').focus();
+  }
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 function refresh() { fetchStatus(); fetchLogs(); }
@@ -1998,7 +2080,6 @@ function refresh() { fetchStatus(); fetchLogs(); }
 fetchStatus();
 fetchLogs();
 fetchShots();
-updateBackupUI();
 updateBackupDateUI();
 updateUploadUI();
 updateChatPlaceholders();
@@ -2028,14 +2109,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # silence access logs
 
+    def _security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'self'",
+        )
+
     def _json(self, data: dict | list, code: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
-        # Restrict to same origin (localhost)
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -2045,23 +2139,87 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-cache")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(b)
 
+    def _launcher_proof(self, nonce: str) -> None:
+        proof = hmac.new(
+            DASHBOARD_TOKEN.encode("ascii"), nonce.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        body = json.dumps({"proof": proof}).encode("ascii")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        # Private file launchers have an opaque `null` origin. The proof
+        # authenticates this server before the launcher sends its bearer token.
+        self.send_header("Access-Control-Allow-Origin", "null")
+        self.send_header("Vary", "Origin")
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _require_authentication(self, parsed=None, *, allow_query: bool = False) -> bool:
+        candidate = self.headers.get(DASHBOARD_TOKEN_HEADER, "")
+        if allow_query and parsed is not None and not candidate:
+            candidate = parse_qs(parsed.query).get("token", [""])[0]
+        if candidate and hmac.compare_digest(candidate, DASHBOARD_TOKEN):
+            return True
+        self._json(
+            {
+                "ok": False,
+                "error": "Dashboard authentication required. Open it with the URL printed by dashboard.py or run the flowtrack command.",
+            },
+            code=401,
+        )
+        return False
+
     def _body(self) -> dict:
+        raw_length = self.headers.get("Content-Length", "0")
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            return json.loads(self.rfile.read(n)) if n else {}
-        except Exception:
+            length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length header.") from exc
+        if length < 0:
+            raise ValueError("Content-Length cannot be negative.")
+        if length > MAX_REQUEST_BYTES:
+            raise OverflowError(f"Request body exceeds {MAX_REQUEST_BYTES} bytes.")
+        if not length:
             return {}
+        try:
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("Request body must be valid JSON.") from exc
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return body
+
+    def _allow_local_request(self) -> bool:
+        port = int(self.server.server_address[1])
+        if _local_host_and_port(self.headers.get("Host", ""), port):
+            return True
+        self._json({"ok": False, "error": "Only direct localhost requests are allowed."}, code=403)
+        return False
 
     def do_GET(self) -> None:
+        if not self._allow_local_request():
+            return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/launcher-proof":
+            nonce = parse_qs(parsed.query).get("nonce", [""])[0]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", nonce):
+                self._json({"ok": False, "error": "Invalid launcher nonce."}, code=400)
+                return
+            self._launcher_proof(nonce)
+            return
+        if not self._require_authentication(parsed, allow_query=True):
+            return
         path   = parsed.path
         qs     = parse_qs(parsed.query)
 
         if path == "/":
-            self._html(HTML)
+            self._html(HTML.replace("__FLOWTRACK_TOKEN__", json.dumps(DASHBOARD_TOKEN)))
 
         elif path == "/api/status":
             svc  = service_status()
@@ -2093,7 +2251,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"enabled": result.strip() == "enabled", "supported": True})
 
         elif path == "/api/logs":
-            limit   = min(int(qs.get("limit", ["100"])[0]), 500)
+            try:
+                limit = max(1, min(int(qs.get("limit", ["100"])[0]), 500))
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "limit must be an integer from 1 to 500."}, code=400)
+                return
             entries = today_events()
             self._json({
                 "total":       len(entries),
@@ -2107,16 +2269,24 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/screenshots/"):
             # ── Security: strict filename validation prevents path traversal ──
             name = path[len("/screenshots/"):]
-            if not re.fullmatch(r"[\w\-]+\.jpe?g", name):
-                self.send_response(400); self.end_headers(); return
+            if not re.fullmatch(r"[A-Za-z0-9_-]+\.(?:jpe?g|png)", name, re.IGNORECASE):
+                self._json({"ok": False, "error": "Invalid screenshot filename."}, code=400)
+                return
             f = SCREENSHOTS_DIR / name
             if not f.exists() or not f.is_file():
-                self.send_response(404); self.end_headers(); return
-            data = f.read_bytes()
+                self._json({"ok": False, "error": "Screenshot not found."}, code=404)
+                return
+            try:
+                data = f.read_bytes()
+            except OSError:
+                self._json({"ok": False, "error": "Screenshot could not be read."}, code=404)
+                return
             self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
+            content_type = "image/png" if f.suffix.lower() == ".png" else "image/jpeg"
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "max-age=3600")
+            self._security_headers()
             self.end_headers()
             self.wfile.write(data)
 
@@ -2129,12 +2299,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_result)
 
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._json({"ok": False, "error": "Not found."}, code=404)
 
     def do_POST(self) -> None:
+        if not self._allow_local_request():
+            return
+        if not self._require_authentication():
+            return
+        port = int(self.server.server_address[1])
+        origin = self.headers.get("Origin", "")
+        if origin and not _local_origin(origin, port):
+            self._json({"ok": False, "error": "Cross-origin requests are not allowed."}, code=403)
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._json({"ok": False, "error": "Content-Type must be application/json."}, code=415)
+            return
         path = urlparse(self.path).path
-        body = self._body()
+        try:
+            body = self._body()
+        except OverflowError as exc:
+            self._json({"ok": False, "error": str(exc)}, code=413)
+            return
+        except ValueError as exc:
+            self._json({"ok": False, "error": str(exc)}, code=400)
+            return
 
         if path == "/api/ollama":
             action = str(body.get("action", ""))
@@ -2145,15 +2333,26 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "unload":
                 # Sending keep_alive=0 tells Ollama to immediately evict the model from RAM/VRAM.
                 try:
-                    payload = json.dumps({"model": model, "keep_alive": 0}).encode()
-                    req = urllib.request.Request(
-                        "http://localhost:11434/api/generate",
-                        data=payload,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    urllib.request.urlopen(req, timeout=10).close()
-                    self._json({"ok": True, "message": f"'{model}' unloaded — RAM freed."})
+                    models = [model] if model and model != "__auto__" else []
+                    if not models:
+                        with urllib.request.urlopen("http://localhost:11434/api/ps", timeout=5) as response:
+                            running = json.loads(response.read())
+                        models = [
+                            item.get("name", "")
+                            for item in running.get("models", [])
+                            if isinstance(item, dict) and item.get("name")
+                        ]
+                    for loaded_model in models:
+                        payload = json.dumps({"model": loaded_model, "keep_alive": 0}).encode()
+                        req = urllib.request.Request(
+                            "http://localhost:11434/api/generate",
+                            data=payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        urllib.request.urlopen(req, timeout=10).close()
+                    message = "No model is currently loaded." if not models else f"Unloaded {', '.join(models)} — RAM freed."
+                    self._json({"ok": True, "message": message})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)})
             else:
@@ -2175,56 +2374,58 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError as exc:
                     self._json({"ok": False, "error": f"Service action failed: {exc}"}, code=500)
                     return
+                self._json({"ok": True})
+                return
             elif action in ("enable", "disable"):
                 if platform.system() != "Linux":
                     self._json({"ok": False, "error": "Auto-start uses systemd and is Linux-only."}, code=400)
                     return
                 units = [SERVICE_NAME, "flowtrack-dashboard.service"]
+                failures = []
                 for unit in units:
                     try:
-                        subprocess.run(
+                        result = subprocess.run(
                             ["systemctl", "--user", action, unit],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             check=False,
                         )
-                    except OSError:
-                        pass
+                        if result.returncode != 0:
+                            failures.append(unit)
+                    except OSError as exc:
+                        self._json({"ok": False, "error": f"Auto-start change failed: {exc}"}, code=500)
+                        return
+                if failures:
+                    self._json({"ok": False, "error": f"Could not {action}: {', '.join(failures)}"}, code=500)
+                    return
                 enabled = action == "enable"
                 self._json({"ok": True, "enabled": enabled})
                 return
-            self._json({"ok": True})
+            self._json({"ok": False, "error": "Unknown service action."}, code=400)
 
         elif path == "/api/analyze":
             provider = str(body.get("provider", ""))
             model = str(body.get("model", ""))
             api_key = str(body.get("api_key", ""))
-            _start_analysis(bool(body.get("ai", False)), provider=provider, model=model, api_key=api_key)
-            self._json({"ok": True, "status": "started"})
+            started = _start_analysis(bool(body.get("ai", False)), provider=provider, model=model, api_key=api_key)
+            if started:
+                self._json({"ok": True, "status": "started"})
+            else:
+                self._json({"ok": False, "error": _result.get("output", "Analysis is already running.")}, code=409)
 
         elif path == "/api/open-screenshots":
-          opener = "xdg-open"
-          if platform.system() == "Darwin":
-            opener = "open"
-          elif platform.system() == "Windows":
-            opener = "explorer"
-          try:
-            subprocess.Popen(
-              [opener, str(SCREENSHOTS_DIR)],
-              stdout=subprocess.DEVNULL,
-              stderr=subprocess.DEVNULL,
-            )
-          except OSError as exc:
-            self._json({"ok": False, "error": f"Open folder failed: {exc}"}, code=500)
+          ok, error = _open_folder(SCREENSHOTS_DIR)
+          if not ok:
+            self._json({"ok": False, "error": error}, code=500)
             return
-            self._json({"ok": True})
+          self._json({"ok": True})
 
         elif path == "/api/sync-json":
           provider = str(body.get("provider", "gist"))
           target = str(body.get("target", ""))
           api_key = str(body.get("api_key", ""))
           result = sync_json_to_cloud(provider=provider, target=target, api_key=api_key)
-          self._json(result)
+          self._json(result, code=200 if result.get("ok") else 400)
 
         elif path == "/api/models":
           provider = str(body.get("provider", "ollama")).strip().lower()
@@ -2237,29 +2438,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "models": models})
 
         elif path == "/api/chat":
-          provider = str(body.get("provider", "ollama"))
+          provider = str(body.get("provider", "ollama")).strip().lower()
           model = str(body.get("model", "")).strip()
           api_key = str(body.get("api_key", ""))
           base_url = str(body.get("base_url", ""))
           if not model:
-            if provider == "openai":
-              model = "gpt-4o-mini"
-            elif provider == "anthropic":
-              model = "claude-3-5-sonnet-20241022"
-            elif provider == "gemini":
-              model = "gemini-2.0-flash"
-            elif provider in ("xai", "grok"):
-              model = "grok-2-latest"
-            elif provider == "openrouter":
-              model = "openai/gpt-4o-mini"
-            elif provider == "llamaapi":
-              model = "llama3.1-70b"
-            elif provider in ("together", "opensource"):
-              model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-            elif provider == "groq":
-              model = "llama-3.1-8b-instant"
-            else:
-              model = "llama3"
+            model = CHAT_PROVIDER_DEFAULT_MODELS.get(provider, "")
+          if not model:
+            self._json({"ok": False, "error": f"Unsupported provider: {provider}"}, code=400)
+            return
           prompt = str(body.get("prompt", "")).strip()
           if not prompt:
             self._json({"ok": False, "error": "Prompt is empty."}, code=400)
@@ -2310,33 +2497,18 @@ class Handler(BaseHTTPRequestHandler):
           backup_type = str(body.get("backup_type", "today"))
           start_date = str(body.get("start_date", ""))
           end_date = str(body.get("end_date", ""))
-          
-          # Export logs by date
-          if backup_type == "custom":
-            data = export_logs_by_date(start_date, end_date)
-          elif backup_type == "today":
-            data = export_logs_by_date()
-          else:  # all
-            data = {"exported_at": datetime.datetime.now().isoformat(timespec="seconds"), "logs": {f.name: f.read_text(encoding="utf-8") for f in LOG_DIR.glob("*.jsonl")}}
-          
+          data = logs_for_scope(backup_type, start_date, end_date)
           if "error" in data:
-            self._json({"ok": False, "error": data.get("error")})
+            self._json({"ok": False, "error": data.get("error")}, code=400)
             return
-          
-          # Convert to JSONL format (one JSON object per line)
-          content = ""
-          for filename, file_content in data.get("logs", {}).items():
-            for line in file_content.strip().split("\n"):
-              if line.strip():
-                content += line + "\n"
-          
-          # Send as downloadable file
+          content = logs_as_jsonl(data.get("logs", {}))
           self.send_response(200)
-          self.send_header("Content-Type", "application/octet-stream")
+          self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
           self.send_header("Content-Disposition", f'attachment; filename="flowtrack-backup-{datetime.datetime.now().strftime("%Y-%m-%d")}.jsonl"')
-          self.send_header("Content-Length", len(content.encode()))
+          self.send_header("Content-Length", str(len(content)))
+          self._security_headers()
           self.end_headers()
-          self.wfile.write(content.encode())
+          self.wfile.write(content)
 
         elif path == "/api/backup-upload":
           backup_type = str(body.get("backup_type", "today"))
@@ -2346,86 +2518,20 @@ class Handler(BaseHTTPRequestHandler):
           credential = str(body.get("credential", ""))
           
           if not credential:
-            self._json({"ok": False, "error": f"Missing credential for {provider}"})
+            self._json({"ok": False, "error": f"Missing credential for {provider}"}, code=400)
             return
           
-          # Export logs by date
-          if backup_type == "custom":
-            data = export_logs_by_date(start_date, end_date)
-          elif backup_type == "today":
-            data = export_logs_by_date()
-          else:  # all
-            data = {"exported_at": datetime.datetime.now().isoformat(timespec="seconds"), "logs": {f.name: f.read_text(encoding="utf-8") for f in LOG_DIR.glob("*.jsonl")}}
+          data = logs_for_scope(backup_type, start_date, end_date)
           
           if "error" in data:
-            self._json({"ok": False, "error": data.get("error")})
+            self._json({"ok": False, "error": data.get("error")}, code=400)
             return
+          logs = data.get("logs", {})
           
-          # Convert to JSONL
-          content = ""
-          for filename, file_content in data.get("logs", {}).items():
-            for line in file_content.strip().split("\n"):
-              if line.strip():
-                content += line + "\n"
-          
-          # Upload based on provider
-          if provider == "gist":
-            try:
-              url = "https://api.github.com/gists"
-              payload = {
-                "description": f"Flowtrack logs backup {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                "public": False,
-                "files": {"flowtrack-backup.jsonl": {"content": content}},
-              }
-              req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                  "Content-Type": "application/json",
-                  "Authorization": f"Bearer {credential}",
-                  "Accept": "application/vnd.github+json",
-                },
-                method="POST",
-              )
-              with urllib.request.urlopen(req, timeout=20) as resp:
-                gist = json.loads(resp.read())
-              if gist.get("html_url"):
-                gist_url = gist.get("html_url", "")
-                self._json({"ok": True, "message": "Uploaded to GitHub Gist", "url": gist_url})
-              else:
-                self._json({"ok": False, "error": "GitHub did not return a gist URL."})
-            except urllib.error.HTTPError as e:
-              detail = e.read().decode("utf-8", errors="replace")
-              self._json({"ok": False, "error": f"GitHub upload failed (HTTP {e.code}): {detail[:300]}"})
-            except Exception as e:
-              self._json({"ok": False, "error": f"GitHub upload failed: {str(e)}"})
-          
-          elif provider == "gdrive":
-            self._json({"ok": False, "error": "Google Drive upload coming soon. For now, use GitHub Gist or webhook."})
-          
-          elif provider == "webhook":
-            try:
-              payload = {"backup_data": content, "timestamp": datetime.datetime.now().isoformat(timespec="seconds"), "backup_type": backup_type}
-              req = urllib.request.Request(
-                credential,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-              )
-              with urllib.request.urlopen(req, timeout=20) as resp:
-                status = resp.status
-              if status in [200, 201]:
-                self._json({"ok": True, "message": "Webhook upload successful"})
-              else:
-                self._json({"ok": False, "error": f"Webhook returned {status}"})
-            except urllib.error.HTTPError as e:
-              detail = e.read().decode("utf-8", errors="replace")
-              self._json({"ok": False, "error": f"Webhook upload failed (HTTP {e.code}): {detail[:300]}"})
-            except Exception as e:
-              self._json({"ok": False, "error": f"Webhook upload failed: {str(e)}"})
-          
-          else:
-            self._json({"ok": False, "error": f"Unknown provider: {provider}"})
+          target = credential if provider == "webhook" else ""
+          api_key = credential if provider == "gist" else ""
+          result = sync_json_to_cloud(provider, target, api_key, logs=logs)
+          self._json(result, code=200 if result.get("ok") else 400)
 
         elif path == "/api/backup-date-range":
           backup_type = str(body.get("backup_type", "today"))
@@ -2435,36 +2541,30 @@ class Handler(BaseHTTPRequestHandler):
           target = str(body.get("target", ""))
           api_key = str(body.get("api_key", ""))
           
-          # Export logs by date
-          data = export_logs_by_date(start_date, end_date) if backup_type == "custom" else (
-            export_logs_by_date() if backup_type == "today" else (
-              {"exported_at": datetime.datetime.now().isoformat(timespec="seconds"), "logs": {f.name: f.read_text(encoding="utf-8") for f in LOG_DIR.glob("*.jsonl")}} if backup_type == "all" else {}
-            )
-          )
-          
+          data = logs_for_scope(backup_type, start_date, end_date)
           if "error" in data:
-            self._json({"ok": False, "error": data.get("error")})
+            self._json({"ok": False, "error": data.get("error")}, code=400)
             return
-          
-          # Upload to cloud
-          result = sync_json_to_cloud(provider, target, api_key)
-          if result["ok"]:
-            self._json({"ok": True, "message": result.get("message", "Backup successful"), "url": result.get("url", "")})
-          else:
-            self._json({"ok": False, "error": result.get("error", "Backup failed")})
+          result = sync_json_to_cloud(provider, target, api_key, logs=data.get("logs", {}))
+          self._json(result, code=200 if result.get("ok") else 400)
 
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._json({"ok": False, "error": "Not found."}, code=404)
 
     def do_OPTIONS(self) -> None:
-        self.send_response(200)
+        if not self._allow_local_request():
+            return
+        if not self._require_authentication():
+            return
+        self.send_response(204)
         self.send_header("Allow", "GET, POST, OPTIONS")
+        self._security_headers()
         self.end_headers()
 
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -2474,21 +2574,21 @@ def main() -> None:
     url    = f"http://{HOST}:{PORT}"
     print(f"Flowtrack Dashboard → {url}")
     print("Press Ctrl+C to stop.")
-    # Auto-open browser (best-effort, non-blocking)
-    opener = "xdg-open"
-    if platform.system() == "Darwin":
-        opener = "open"
-    elif platform.system() == "Windows":
-        opener = "explorer"
-    subprocess.Popen(
-        [opener, url],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # Manual runs open a browser; the systemd unit opts out to avoid opening a
+    # new tab on every service restart.
+    no_browser = os.environ.get("FLOWTRACK_NO_BROWSER", "").lower() in {"1", "true", "yes"}
+    if no_browser:
+        print(f"Use the flowtrack command, or open the private launcher at {DASHBOARD_LAUNCHER}.")
+    else:
+        print(f"Authenticated launcher → {DASHBOARD_LAUNCHER}")
+        launcher_url = DASHBOARD_LAUNCHER.resolve().as_uri()
+        threading.Thread(target=_open_browser, args=(launcher_url,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDashboard stopped.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

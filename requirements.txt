@@ -1,11 +1,12 @@
-# FocusFlow - Python dependencies
-# Install with:  pip install -r requirements.txt
+# Flowtrack runtime dependencies
+# Install with: python -m pip install -r requirements.txt
 
-# Fast screenshot capture (X11 & Wayland)
+# Cross-platform screenshot capture. On Linux, Flowtrack supports X11 only.
+# tracker.py uses the compatibility factory available throughout this range.
 mss>=9.0.1
 
 # Image processing (resize, grayscale, JPEG compression)
 Pillow>=10.0.0
 
-# All other code uses Python 3.9+ stdlib only:
+# All other code uses the Python 3.10+ standard library:
 #   json, pathlib, subprocess, collections, datetime, signal, re, urllib

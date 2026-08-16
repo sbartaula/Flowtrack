@@ -9,10 +9,11 @@ ExecStart=%h/.focusaudit/venv/bin/python3 %h/.focusaudit/dashboard.py
 Restart=on-failure
 RestartSec=5
 Environment="PYTHONUNBUFFERED=1"
+Environment="FLOWTRACK_HOME=%h/.focusaudit"
+Environment="FLOWTRACK_NO_BROWSER=1"
 StandardOutput=append:%h/.focusaudit/dashboard.log
 StandardError=append:%h/.focusaudit/dashboard.log
 NoNewPrivileges=true
-MemoryMax=80M
 
 [Install]
 WantedBy=default.target
