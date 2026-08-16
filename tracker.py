@@ -17,19 +17,18 @@ Storage layout:
 
 import os
 import platform
-import sys
 import json
+import ctypes
+import ntpath
+import re
 import time
 import signal
 import logging
 import datetime
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
-
-# ── Ensure DISPLAY is available for X11 tools launched from systemd ────────────
-os.environ.setdefault("DISPLAY", ":0")
-os.environ.setdefault("XAUTHORITY", str(Path.home() / ".Xauthority"))
+from typing import Callable, Optional, Tuple
 
 # ── Optional heavy dependencies ─────────────────────────────────────────────────
 try:
@@ -45,7 +44,7 @@ except ImportError:
     HAS_MSS = False
 
 # ── Configuration ────────────────────────────────────────────────────────────────
-BASE_DIR        = Path.home() / ".focusaudit"
+BASE_DIR        = Path(os.environ.get("FLOWTRACK_HOME", Path.home() / ".focusaudit")).expanduser()
 SCREENSHOTS_DIR = BASE_DIR / "screenshots"
 LOG_DIR         = BASE_DIR / "logs"
 SYSTEM_LOG      = BASE_DIR / "tracker.log"
@@ -57,10 +56,40 @@ IMG_WIDTH       = 1000   # resize screenshots to this width (px)
 IMG_QUALITY     = 60     # JPEG quality (0-100)
 SCREENSHOT_MAX_GB = 3    # hard cap for screenshot storage
 
+# Comma/semicolon/newline-separated, case-insensitive substrings. Matching
+# windows are neither logged nor screenshotted (for example: "1Password,bank").
+EXCLUDE_PATTERNS = tuple(
+    value.strip().casefold()
+    for value in re.split(r"[,;\n]", os.environ.get("FLOWTRACK_EXCLUDE", ""))
+    if value.strip()
+)
+
 # ── Directory setup ──────────────────────────────────────────────────────────────
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-SCREENSHOTS_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "posix":
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+
+
+def _ensure_private_file(path: Path) -> None:
+    if os.name == "posix":
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+
+for _data_dir in (BASE_DIR, SCREENSHOTS_DIR, LOG_DIR):
+    _ensure_private_dir(_data_dir)
+
+# Create the log securely before logging opens it. O_APPEND preserves prior
+# diagnostics while the explicit mode avoids umask-dependent privacy leaks.
+_log_fd = os.open(SYSTEM_LOG, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+os.close(_log_fd)
+_ensure_private_file(SYSTEM_LOG)
 
 logging.basicConfig(
     filename=str(SYSTEM_LOG),
@@ -71,7 +100,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  Window title detection  (X11 primary → Wayland/GNOME fallback → xprop)
+#  Window title detection  (native APIs; Linux desktop capture requires X11)
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _run(cmd: list, timeout: int = 2) -> Optional[str]:
@@ -90,46 +119,157 @@ def _app_name_from_pid(pid: str) -> str:
         return "unknown"
 
 
+def _get_windows_foreground_ctypes() -> Optional[Tuple[str, str]]:
+    """Read the foreground window using Win32 directly, without a subprocess."""
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        window = user32.GetForegroundWindow()
+        if not window:
+            return None
+
+        title_length = user32.GetWindowTextLengthW(window)
+        if title_length <= 0:
+            return None
+        title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+        if user32.GetWindowTextW(window, title_buffer, len(title_buffer)) <= 0:
+            return None
+        title = title_buffer.value.strip()
+        if not title:
+            return None
+
+        process_id = wintypes.DWORD()
+        if not user32.GetWindowThreadProcessId(window, ctypes.byref(process_id)):
+            return None
+        if not process_id.value:
+            return None
+
+        # PROCESS_QUERY_LIMITED_INFORMATION is enough for
+        # QueryFullProcessImageNameW and avoids requesting broader privileges.
+        process = kernel32.OpenProcess(0x1000, False, process_id.value)
+        if not process:
+            return None
+        try:
+            executable_buffer = ctypes.create_unicode_buffer(32768)
+            executable_length = wintypes.DWORD(len(executable_buffer))
+            if not kernel32.QueryFullProcessImageNameW(
+                process,
+                0,
+                executable_buffer,
+                ctypes.byref(executable_length),
+            ):
+                return None
+            executable = executable_buffer.value.strip()
+        finally:
+            kernel32.CloseHandle(process)
+
+        app = ntpath.splitext(ntpath.basename(executable))[0].strip()
+        return (title, app) if app else None
+    except Exception as exc:
+        # Some protected/system windows deny process access. The caller can use
+        # the slower PowerShell compatibility path for those cases.
+        log.debug("Win32 foreground query failed: %s", exc)
+        return None
+
+
+def _get_windows_foreground_powershell() -> Optional[Tuple[str, str]]:
+    """Compatibility fallback when direct Win32 access is unavailable."""
+    ps_script = (
+        "$sig='[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();"
+        "[DllImport(\"user32.dll\",CharSet=CharSet.Unicode,SetLastError=true)]public static extern int GetWindowText(IntPtr hWnd,System.Text.StringBuilder text,int count);"
+        "[DllImport(\"user32.dll\")]public static extern uint GetWindowThreadProcessId(IntPtr hWnd,[ref] uint processId);';"
+        "Add-Type -MemberDefinition $sig -Name Win32 -Namespace Native -ErrorAction SilentlyContinue | Out-Null;"
+        "$h=[Native.Win32]::GetForegroundWindow();"
+        "$sb=New-Object System.Text.StringBuilder 32768;"
+        "[void][Native.Win32]::GetWindowText($h,$sb,$sb.Capacity);"
+        "$processId=[uint32]0; [void][Native.Win32]::GetWindowThreadProcessId($h,[ref]$processId);"
+        "$p=(Get-Process -Id $processId -ErrorAction SilentlyContinue);"
+        "$appName=if($p){$p.ProcessName}else{'unknown'};"
+        "[Console]::Out.Write($sb.ToString()+[char]31+$appName);"
+    )
+    raw = _run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            ps_script,
+        ],
+        timeout=3,
+    )
+    if raw:
+        title, separator, app = raw.partition("\x1f")
+        if separator and title.strip():
+            return title.strip(), app.strip() or "unknown"
+    return None
+
+
 def get_active_window_info() -> Tuple[str, str]:
     """Return (window_title, app_name) for the currently focused window."""
 
     system_name = platform.system()
 
-    # ── Windows native (PowerShell + user32) ───────────────────────────────
+    # ── Windows native (Win32 ctypes; PowerShell compatibility fallback) ───
     if system_name == "Windows":
-        ps_script = (
-            "$sig='[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();"
-            "[DllImport(\"user32.dll\",SetLastError=true)]public static extern int GetWindowText(IntPtr hWnd,System.Text.StringBuilder text,int count);"
-            "[DllImport(\"user32.dll\")]public static extern uint GetWindowThreadProcessId(IntPtr hWnd,[ref] uint processId);';"
-            "Add-Type -MemberDefinition $sig -Name Win32 -Namespace Native -ErrorAction SilentlyContinue | Out-Null;"
-            "$h=[Native.Win32]::GetForegroundWindow();"
-            "$sb=New-Object System.Text.StringBuilder 1024;"
-            "[void][Native.Win32]::GetWindowText($h,$sb,$sb.Capacity);"
-            "$pid=0; [void][Native.Win32]::GetWindowThreadProcessId($h,[ref]$pid);"
-            "$p=(Get-Process -Id $pid -ErrorAction SilentlyContinue);"
-            "Write-Output $sb.ToString();"
-            "if ($p) { Write-Output $p.ProcessName }"
+        return (
+            _get_windows_foreground_ctypes()
+            or _get_windows_foreground_powershell()
+            or ("Unknown", "unknown")
         )
-        raw = _run(["powershell", "-NoProfile", "-Command", ps_script], timeout=3)
-        if raw:
-            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-            if lines:
-                title = lines[0]
-                app = lines[1] if len(lines) > 1 else "unknown"
-                return title, app
 
     # ── macOS native (AppleScript) ──────────────────────────────────────────
     if system_name == "Darwin":
-        app = _run([
-            "osascript", "-e",
-            "tell application \"System Events\" to get name of first process whose frontmost is true",
-        ], timeout=3)
-        title = _run([
-            "osascript", "-e",
-            "tell application \"System Events\" to get name of front window of (first process whose frontmost is true)",
-        ], timeout=3)
-        if title:
-            return title, app or "unknown"
+        script = (
+            'tell application "System Events"\n'
+            "set frontProcess to first application process whose frontmost is true\n"
+            "set appName to name of frontProcess\n"
+            "try\n"
+            "set windowTitle to name of front window of frontProcess\n"
+            "on error\n"
+            "set windowTitle to appName\n"
+            "end try\n"
+            "return windowTitle & (character id 31) & appName\n"
+            "end tell"
+        )
+        raw = _run(["osascript", "-e", script], timeout=3)
+        if raw:
+            title, separator, app = raw.partition("\x1f")
+            if separator and title.strip():
+                return title.strip(), app.strip() or "unknown"
+        return "Unknown", "unknown"
+
+    # The remaining probes are Linux/X11 or GNOME-specific. Running them on
+    # macOS/Windows masks native permission/configuration errors with noise.
+    if system_name != "Linux":
+        return "Unknown", "unknown"
 
     # ── xdotool (X11) ────────────────────────────────────────────────────────
     title = _run(["xdotool", "getactivewindow", "getwindowname"])
@@ -187,7 +327,8 @@ def take_screenshot() -> Optional[str]:
     if HAS_MSS and HAS_PIL:
         try:
             import mss as _mss
-            with _mss.MSS() as sct:
+            # The lowercase factory works from mss 9.x through current releases.
+            with _mss.mss() as sct:
                 monitor = sct.monitors[1]      # primary monitor
                 raw     = sct.grab(monitor)
                 img     = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
@@ -196,7 +337,7 @@ def take_screenshot() -> Optional[str]:
             img = None
 
     # ── scrot fallback ────────────────────────────────────────────────────────
-    if img is None:
+    if img is None and platform.system() == "Linux":
         tmp = SCREENSHOTS_DIR / f"{ts}_raw.png"
         ok  = _run(["scrot", str(tmp)], timeout=5)
         if ok is not None or tmp.exists():
@@ -210,7 +351,9 @@ def take_screenshot() -> Optional[str]:
                     return None
             elif tmp.exists():
                 # No PIL — keep the raw PNG, rename to match expected filename
-                tmp.rename(dst.with_suffix(".png"))
+                png_dst = dst.with_suffix(".png")
+                tmp.rename(png_dst)
+                _ensure_private_file(png_dst)
                 return filename.replace(".jpg", ".png")
             else:
                 return None
@@ -225,6 +368,7 @@ def take_screenshot() -> Optional[str]:
         img        = img.resize((IMG_WIDTH, new_height), Image.LANCZOS)
         img        = img.convert("L")                           # grayscale
         img.save(str(dst), "JPEG", quality=IMG_QUALITY, optimize=True)
+        _ensure_private_file(dst)
         return filename
     except Exception as exc:
         log.warning("Image processing failed: %s", exc)
@@ -290,8 +434,9 @@ def enforce_screenshot_storage_cap(max_gb: float = SCREENSHOT_MAX_GB) -> None:
 #  Logging
 # ════════════════════════════════════════════════════════════════════════════════
 
-def _daily_log_path() -> Path:
-    return LOG_DIR / f"{datetime.date.today().isoformat()}.jsonl"
+def _daily_log_path(timestamp: Optional[datetime.datetime] = None) -> Path:
+    log_date = timestamp.date() if timestamp is not None else datetime.date.today()
+    return LOG_DIR / f"{log_date.isoformat()}.jsonl"
 
 
 def append_log_entry(
@@ -299,26 +444,174 @@ def append_log_entry(
     app: str,
     event: str,            # "change" | "interval"
     screenshot: Optional[str],
-    duration: float,       # seconds spent on the previous window
+    duration: float,       # non-overlapping seconds represented by this row
+    timestamp: Optional[datetime.datetime] = None,
+    schema_version: int = 2,
 ) -> None:
-    """Append one JSON line to today's JSONL log. Never truncates the file."""
+    """Append one JSON line to the segment-start day's log without truncating."""
+    timestamp = timestamp or datetime.datetime.now()
     entry = {
-        "ts":         datetime.datetime.now().isoformat(timespec="seconds"),
+        "schema_version": schema_version,
+        "ts":         timestamp.isoformat(timespec="seconds"),
         "title":      title,
         "app":        app,
         "event":      event,
-        "duration":   round(duration, 1),
+        "duration":   round(max(0.0, duration), 1),
         "screenshot": screenshot,
     }
-    with open(_daily_log_path(), "a", encoding="utf-8") as fh:
+    path = _daily_log_path(timestamp)
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _ensure_private_file(path)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  Main tracking loop
 # ════════════════════════════════════════════════════════════════════════════════
 
-_running = True
+@dataclass
+class _Segment:
+    title: str
+    app: str
+    started_monotonic: float
+    started_wall: datetime.datetime
+    screenshot: Optional[str]
+
+
+class SegmentRecorder:
+    """Turn polling observations into non-overlapping activity segments."""
+
+    UNKNOWN_DEBOUNCE_POLLS = 3
+
+    def __init__(
+        self,
+        writer: Callable[..., None] = append_log_entry,
+        screenshotter: Callable[[], Optional[str]] = take_screenshot,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime.datetime] = datetime.datetime.now,
+        interval: float = LOG_INTERVAL,
+        exclude_patterns: Tuple[str, ...] = EXCLUDE_PATTERNS,
+        storage_capper: Callable[[], None] = enforce_screenshot_storage_cap,
+        max_observation_gap: Optional[float] = None,
+    ) -> None:
+        self._writer = writer
+        self._screenshotter = screenshotter
+        self._monotonic = monotonic
+        self._wall_clock = wall_clock
+        self._interval = interval
+        self._exclude_patterns = exclude_patterns
+        self._storage_capper = storage_capper
+        self._max_observation_gap = max_observation_gap or max(interval * 2, 60.0)
+        self._segment: Optional[_Segment] = None
+        self._unknown_count = 0
+        self._unknown_since: Optional[float] = None
+        self._last_observed: Optional[float] = None
+
+    @staticmethod
+    def _unknown(title: str) -> bool:
+        return not title.strip() or title.strip().casefold() in {"unknown", "n/a"}
+
+    def _excluded(self, title: str, app: str) -> bool:
+        searchable = f"{app}\n{title}".casefold()
+        return any(pattern in searchable for pattern in self._exclude_patterns)
+
+    def _start(
+        self,
+        title: str,
+        app: str,
+        now: float,
+        wall_now: datetime.datetime,
+    ) -> None:
+        screenshot = self._screenshotter()
+        try:
+            self._storage_capper()
+        except OSError as exc:
+            log.warning("Storage cap check failed: %s", exc)
+        self._segment = _Segment(title, app, now, wall_now, screenshot)
+
+    def _finish(self, event: str, now: float) -> None:
+        segment = self._segment
+        if segment is None:
+            return
+        self._writer(
+            segment.title,
+            segment.app,
+            event,
+            segment.screenshot,
+            max(0.0, now - segment.started_monotonic),
+            timestamp=segment.started_wall,
+            schema_version=2,
+        )
+        self._segment = None
+
+    def observe(
+        self,
+        title: str,
+        app: str,
+        *,
+        now: Optional[float] = None,
+        wall_now: Optional[datetime.datetime] = None,
+    ) -> None:
+        now = self._monotonic() if now is None else now
+        wall_now = self._wall_clock() if wall_now is None else wall_now
+
+        # Suspend/resume and a wedged desktop probe must not be reported as
+        # active work. Close at the last trustworthy poll and start a fresh
+        # segment from the current observation.
+        if self._last_observed is not None:
+            gap = now - self._last_observed
+            if gap < 0 or gap > self._max_observation_gap:
+                cutoff = self._unknown_since
+                if cutoff is None:
+                    cutoff = self._last_observed + min(POLL_INTERVAL, max(0.0, gap))
+                self._finish("interval", cutoff)
+                self._unknown_count = 0
+                self._unknown_since = None
+        self._last_observed = now
+
+        # A single failed desktop probe must not manufacture Unknown→window
+        # switches. A sustained outage closes the prior segment at the first
+        # failed poll so downtime is not credited as active work.
+        if self._unknown(title):
+            self._unknown_count += 1
+            if self._unknown_since is None:
+                self._unknown_since = now
+            if self._unknown_count == self.UNKNOWN_DEBOUNCE_POLLS:
+                self._finish("interval", self._unknown_since)
+            return
+        self._unknown_count = 0
+        self._unknown_since = None
+
+        if self._excluded(title, app):
+            # Close without claiming a visible transition: the next logged
+            # segment may follow an arbitrary amount of excluded activity.
+            self._finish("interval", now)
+            return
+
+        if self._segment is None:
+            self._start(title, app, now, wall_now)
+            return
+
+        changed = (title, app) != (self._segment.title, self._segment.app)
+        interval_elapsed = now - self._segment.started_monotonic >= self._interval
+        if changed or interval_elapsed:
+            self._finish("change" if changed else "interval", now)
+            self._start(title, app, now, wall_now)
+
+    def flush(self, *, now: Optional[float] = None) -> None:
+        """Persist the current partial segment during an orderly shutdown."""
+        now = self._monotonic() if now is None else now
+        if self._unknown_since is not None:
+            # With no later successful probe, even a short trailing Unknown
+            # run is unresolved rather than a confirmed transient failure.
+            now = self._unknown_since
+        elif self._last_observed is not None and now - self._last_observed > self._max_observation_gap:
+            now = self._last_observed + POLL_INTERVAL
+        self._finish("interval", now)
+
+
+_running = False
 
 
 def _handle_signal(signum, frame):   # noqa: ARG001
@@ -327,48 +620,32 @@ def _handle_signal(signum, frame):   # noqa: ARG001
     _running = False
 
 
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT,  _handle_signal)
-
-
 def main() -> None:
+    global _running
+    _running = True
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT,  _handle_signal)
     log.info("Flowtrack tracker starting. DISPLAY=%s", os.environ.get("DISPLAY", "unset"))
 
     # Module 2: purge old screenshots on every startup
     purge_old_screenshots()
     enforce_screenshot_storage_cap()
 
-    last_title:    str   = ""
-    last_log_time: float = time.monotonic()
-    window_start:  float = time.monotonic()
-
-    while _running:
+    recorder = SegmentRecorder()
+    try:
+        while _running:
+            try:
+                title, app = get_active_window_info()
+                recorder.observe(title, app)
+            except Exception as exc:            # never crash the daemon
+                log.error("Tracker loop error: %s", exc, exc_info=True)
+            time.sleep(POLL_INTERVAL)
+    finally:
         try:
-            title, app = get_active_window_info()
-            now        = time.monotonic()
-
-            title_changed    = title != last_title
-            interval_elapsed = (now - last_log_time) >= LOG_INTERVAL
-
-            if title_changed or interval_elapsed:
-                duration   = now - window_start
-                event_type = "change" if title_changed else "interval"
-                screenshot = take_screenshot()
-                enforce_screenshot_storage_cap()
-
-                append_log_entry(title, app, event_type, screenshot, duration)
-
-                if title_changed:
-                    window_start = now          # reset timer for new window
-                last_title    = title
-                last_log_time = now
-
-        except Exception as exc:                # never crash the daemon
-            log.error("Tracker loop error: %s", exc, exc_info=True)
-
-        time.sleep(POLL_INTERVAL)
-
-    log.info("Flowtrack tracker stopped.")
+            recorder.flush()
+        except Exception as exc:
+            log.error("Could not flush final activity segment: %s", exc, exc_info=True)
+        log.info("Flowtrack tracker stopped.")
 
 
 if __name__ == "__main__":

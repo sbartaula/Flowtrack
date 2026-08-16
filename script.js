@@ -94,10 +94,13 @@ const demoData = {
 let activePersona = 'builder';
 
 function setPersona(name) {
+  if (!demoData[name]) return;
   activePersona = name;
   const data = demoData[name];
   document.querySelectorAll('.persona').forEach(btn => {
-    btn.classList.toggle('is-active', btn.dataset.persona === name);
+    const isActive = btn.dataset.persona === name;
+    btn.classList.toggle('is-active', isActive);
+    btn.setAttribute('aria-pressed', String(isActive));
   });
   document.getElementById('demoTitle').textContent = data.title;
   document.getElementById('demoMetrics').innerHTML = data.metrics
@@ -120,15 +123,50 @@ function setPersona(name) {
     if (el) el.textContent = value;
   });
   renderDemoChat('biggest');
+  announceDemo(`Showing ${data.title}.`);
 }
 
-function renderDemoChat(key) {
+function announceDemo(message) {
+  const status = document.getElementById('demoStatus');
+  if (status) status.textContent = message;
+}
+
+function renderDemoChat(key, userOverride = '') {
   const data = demoData[activePersona].chat[key];
   const chat = document.getElementById('demoChat');
-  chat.innerHTML = `
-    <div class="demo-msg user">${data.user}</div>
-    <div class="demo-msg ai">${data.ai}</div>
-  `;
+  if (!data || !chat) return;
+  const userMessage = userOverride || data.user;
+  const userBubble = document.createElement('div');
+  userBubble.className = 'demo-msg user';
+  userBubble.textContent = userMessage;
+  const aiBubble = document.createElement('div');
+  aiBubble.className = 'demo-msg ai';
+  aiBubble.textContent = data.ai;
+  chat.textContent = '';
+  chat.append(userBubble, aiBubble);
+}
+
+function submitDemoPrompt() {
+  const input = document.getElementById('demoPrompt');
+  if (!input) {
+    renderDemoChat('tomorrow');
+    return;
+  }
+
+  const prompt = input.value.trim();
+  if (!prompt) {
+    input.focus();
+    announceDemo('Enter a question for the mock focus coach.');
+    return;
+  }
+
+  let responseKey = 'biggest';
+  if (/\b(tomorrow|plan|next|change|improve)\b/i.test(prompt)) responseKey = 'tomorrow';
+  else if (/\b(rule|simple|one thing|habit)\b/i.test(prompt)) responseKey = 'rule';
+
+  renderDemoChat(responseKey, prompt);
+  input.value = '';
+  announceDemo('The local mock coach answered your question.');
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -139,7 +177,16 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.addEventListener('click', () => renderDemoChat(btn.dataset.prompt));
   });
   document.querySelectorAll('.fake-send').forEach(btn => {
-    btn.addEventListener('click', () => renderDemoChat('tomorrow'));
+    btn.addEventListener('click', submitDemoPrompt);
   });
+  const demoPrompt = document.getElementById('demoPrompt');
+  if (demoPrompt) {
+    demoPrompt.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitDemoPrompt();
+      }
+    });
+  }
   setPersona(activePersona);
 });

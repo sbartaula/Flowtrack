@@ -8,12 +8,17 @@
   <meta property="og:title" content="Flowtrack | Local-first Focus Tracking">
   <meta property="og:description" content="Open-source focus tracking with a safe public demo, readable AI reports, and local-first privacy.">
   <meta property="og:type" content="website">
-  <meta property="og:image" content="/social-preview.svg">
+  <meta property="og:image" content="social-preview.png">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Flowtrack dashboard preview with focus score, switching rate, deep-work time, and top distraction metrics.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Flowtrack | Local-first Focus Tracking">
   <meta name="twitter:description" content="Open-source focus tracking with safe demo data and local-first privacy.">
-  <meta name="twitter:image" content="/social-preview.svg">
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <meta name="twitter:image" content="social-preview.png">
+  <meta name="twitter:image:alt" content="Flowtrack dashboard preview with focus and productivity metrics.">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
@@ -31,7 +36,7 @@
         <a href="#demo">Try Demo</a>
         <a href="#local">Run Locally</a>
         <a href="demo.html">Full Demo</a>
-        <a class="github-link" href="https://github.com/saroj479/Flowtrack" target="_blank" rel="noreferrer">
+        <a class="github-link" href="https://github.com/sbartaula/Flowtrack" target="_blank" rel="noreferrer">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.02c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.75-1.34-1.75-1.09-.75.08-.74.08-.74 1.2.09 1.84 1.24 1.84 1.24 1.08 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.67-.31-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.23-.13-.3-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.65.25 2.88.12 3.18.77.85 1.24 1.92 1.24 3.23 0 4.61-2.81 5.61-5.49 5.92.43.37.82 1.11.82 2.24v3.32c0 .32.22.7.83.58A12 12 0 0 0 12 .5Z"></path></svg>
           <span>GitHub</span>
         </a>
@@ -43,7 +48,7 @@
         <div class="hero-copy">
           <p class="eyebrow">Open-source, local-first productivity tracking</p>
           <h1>See where your focus goes, then improve it with AI on your own terms.</h1>
-          <p class="lede">Flowtrack is an open-source local app that tracks work patterns on your machine, scores focus, flags distraction loops, and turns raw activity into readable coaching. This public site is only the landing layer. The real app stays in the main branch and runs locally.</p>
+          <p class="lede">Flowtrack is an open-source local app that tracks work patterns on your machine, scores focus, flags distraction loops, and turns raw activity into readable coaching. This public site is only the landing layer. The real app stays in the repository and runs locally.</p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="#demo">Try Demo</a>
             <a class="btn btn-secondary" href="#local">Run Locally</a>
@@ -53,7 +58,7 @@
             <li>No account required for the demo</li>
             <li>Use Ollama local or cloud providers with API key</li>
             <li>Real data never exposed on this public site</li>
-            <li>Main branch stays the real open-source app</li>
+            <li>The repository stays the real open-source app</li>
           </ul>
         </div>
         <div class="hero-visual" aria-label="Mock Flowtrack dashboard preview">
@@ -151,10 +156,10 @@
         </div>
         <div class="demo-layout">
           <aside class="demo-sidebar">
-            <div class="persona-list" role="tablist" aria-label="Demo personas">
-              <button class="persona is-active" data-persona="builder">Indie builder</button>
-              <button class="persona" data-persona="student">Student</button>
-              <button class="persona" data-persona="designer">Designer</button>
+            <div class="persona-list" role="group" aria-label="Choose a demo persona">
+              <button class="persona is-active" type="button" data-persona="builder" aria-pressed="true">Indie builder</button>
+              <button class="persona" type="button" data-persona="student" aria-pressed="false">Student</button>
+              <button class="persona" type="button" data-persona="designer" aria-pressed="false">Designer</button>
             </div>
             <div class="provider-box">
               <h3>In the real app</h3>
@@ -190,13 +195,14 @@
               <div class="demo-chat-head">
                 <h4>Demo coach chat</h4>
                 <div class="quick-prompts">
-                  <button class="mini-btn" data-prompt="biggest">Biggest problem</button>
-                  <button class="mini-btn" data-prompt="tomorrow">Tomorrow plan</button>
-                  <button class="mini-btn" data-prompt="rule">One simple rule</button>
+                  <button class="mini-btn" type="button" data-prompt="biggest">Biggest problem</button>
+                  <button class="mini-btn" type="button" data-prompt="tomorrow">Tomorrow plan</button>
+                  <button class="mini-btn" type="button" data-prompt="rule">One simple rule</button>
                 </div>
               </div>
-              <div class="demo-chat-thread" id="demoChat"></div>
+              <div class="demo-chat-thread" id="demoChat" aria-live="polite" aria-atomic="true"></div>
             </div>
+            <p class="sr-only" id="demoStatus" aria-live="polite" aria-atomic="true"></p>
           </div>
         </div>
       </section>
@@ -232,9 +238,9 @@
           <article class="path-card">
             <div class="path-tag">Install</div>
             <h3>Developer or power user</h3>
-            <p>Clone the repo and use the main branch directly. This landing branch is only for the public website.</p>
+            <p>Clone the repository and run the open-source app directly.</p>
             <div class="code-stack">
-              <code>git clone https://github.com/saroj479/Flowtrack.git</code>
+              <code>git clone https://github.com/sbartaula/Flowtrack.git</code>
               <code>cd Flowtrack</code>
               <code>bash install.sh</code>
             </div>
@@ -246,12 +252,12 @@
         <div class="privacy-card">
           <div>
             <p class="eyebrow">Open-source first</p>
-            <h2>The website explains the project. The main branch remains the real product.</h2>
+            <h2>The website explains the project. The repository remains the real product.</h2>
             <p>This branch exists so people can understand Flowtrack quickly, try a safe demo, and decide whether to run it locally. The open-source app itself is not replaced or diluted by this site.</p>
           </div>
           <div class="privacy-points">
             <div><strong>Public site:</strong> product explanation + safe mock demo</div>
-            <div><strong>Main branch:</strong> local tracker, dashboard, analysis, and OSS codebase</div>
+            <div><strong>Repository:</strong> local tracker, dashboard, analysis, and OSS codebase</div>
             <div><strong>Later:</strong> private commercial layers can be built separately on top of the open-source foundation</div>
           </div>
         </div>
@@ -260,7 +266,7 @@
 
     <footer class="footer">
       <p>Flowtrack is local-first. This branch is the public landing site for Vercel.</p>
-      <a href="https://github.com/saroj479/Flowtrack" target="_blank" rel="noreferrer">Open the repository</a>
+      <a href="https://github.com/sbartaula/Flowtrack" target="_blank" rel="noreferrer">Open the repository</a>
     </footer>
   </div>
   <script src="script.js"></script>

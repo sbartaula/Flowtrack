@@ -1,0 +1,19 @@
+* text=auto
+
+# Keep executable and configuration files usable after Windows checkouts.
+*.sh      text eol=lf
+*.service text eol=lf
+*.py      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.js      text eol=lf
+*.svg     text eol=lf
+*.md      text eol=lf
+
+# Never apply text conversion to image assets.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
